@@ -1,0 +1,24 @@
+[project]
+name = "popo-cli"
+version = "0.1.0"
+description = "An interactive CLI tool built with typer and rich"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "aiohttp>=3.9.0",
+    "websockets>=12.0.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "web3>=6.0.0",
+]
+
+[project.scripts]
+popo = "popo_cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = []
