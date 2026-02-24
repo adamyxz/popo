@@ -82,7 +82,7 @@ def safe_time_ms(x: Any) -> Optional[int]:
 
 
 def pick_latest_live_market(markets: List[Dict[str, Any]], now_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """Pick latest live market from list."""
+    """Pick latest live market from list. Returns live market, or most recently ended market if none live."""
     if not isinstance(markets, list) or not markets:
         return None
 
@@ -109,6 +109,12 @@ def pick_latest_live_market(markets: List[Dict[str, Any]], now_ms: Optional[int]
     live.sort(key=lambda x: x["endMs"])
     if live:
         return live[0]["m"]
+
+    # No live markets - find most recently ended market (within last hour)
+    recently_ended = [e for e in enriched if e["endMs"] <= now_ms and (now_ms - e["endMs"]) < 3600000]
+    recently_ended.sort(key=lambda x: x["endMs"], reverse=True)
+    if recently_ended:
+        return recently_ended[0]["m"]
 
     # Find upcoming markets
     upcoming = [e for e in enriched if now_ms < e["endMs"]]

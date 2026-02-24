@@ -11,6 +11,8 @@ dependencies = [
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "web3>=6.0.0",
+    "asyncpg>=0.29.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]

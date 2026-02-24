@@ -212,14 +212,34 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
     # Initialize state
     prev_spot_price = None
     prev_current_price = None
+    last_valid_current_price = None  # Cache last valid price for fallback
     price_to_beat_state = {"slug": None, "value": None, "setAtMs": None}
     previous_market_end_info = {"slug": None, "endMs": None}
     price_history: List[Dict[str, Any]] = []
     signal_stats = {"marketSlug": None, "upSignals": 0, "downSignals": 0}
+    last_saved_market_end: Optional[int] = None
+    last_saved_market_slug: Optional[str] = None
+    saved_market_slugs: set = set()
+    _last_market_data: Optional[Dict[str, Any]] = None
+    signals_history: List[Dict[str, Any]] = []  # Track signals for current market
+    consecutive_price_failures = 0  # Track consecutive failures
+    last_valid_poly_data: Optional[Dict[str, Any]] = None  # Cache last valid Polymarket data
+    poly_fetch_failures = 0
+    ws_connection_warnings_shown = False  # Track if we've warned about WS connections
 
     # Create HTTP session
     import aiohttp
     session = aiohttp.ClientSession()
+
+    # Initialize database
+    from ..db import get_db, close_db
+    try:
+        db = await get_db()
+        console.print("[dim]Database connected[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: Database connection failed: {e}[/yellow]")
+        console.print("[dim]Snapshots will not be saved[/dim]")
+        db = None
 
     # Start WebSocket streams (matching JS version)
     # 1. Binance trade stream
@@ -298,9 +318,24 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         # Fall back to HTTP
                         try:
                             chainlink_data = await fetch_chainlink_btc_usd(config["chainlink"])
+                            if chainlink_data.get("price") is None:
+                                console.print(f"[yellow]Warning: Chainlink HTTP returned None price[/yellow]")
                         except Exception as e:
                             console.print(f"[yellow]Warning: Chainlink fetch failed: {e}[/yellow]")
                             chainlink_data = {"price": None, "updatedAt": None, "source": "error"}
+
+                    # Log price availability for debugging
+                    if chainlink_data.get("price") is None:
+                        console.print(f"[dim]Debug: polymarket_ws_price={polymarket_ws_price}, chainlink_ws_price={chainlink_ws_price}[/dim]")
+
+                        # Warn about WebSocket connections once
+                        if not ws_connection_warnings_shown:
+                            console.print("[yellow]Warning: WebSocket prices unavailable - check connections[/yellow]")
+                            console.print("[dim]  Will retry with HTTP fallback...[/dim]")
+                            ws_connection_warnings_shown = True
+                    else:
+                        # Reset warning flag when we get data
+                        ws_connection_warnings_shown = False
 
                     # Fetch Binance data (with error handling)
                     try:
@@ -313,7 +348,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         klines_5m = []
                         last_price = None
 
-                    # Fetch Polymarket (with error handling)
+                    # Fetch Polymarket (with error handling and caching)
                     try:
                         poly = await fetch_polymarket_snapshot(
                             session,
@@ -324,9 +359,27 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                             config["gamma_base_url"],
                             config["clob_base_url"]
                         )
+                        if poly.get("ok"):
+                            last_valid_poly_data = poly
+                            poly_fetch_failures = 0
+                        else:
+                            poly_fetch_failures += 1
+                            console.print(f"[yellow]Warning: Polymarket snapshot failed: {poly.get('reason', 'unknown')}[/yellow]")
+                            # Use cached data if available and failures < 5
+                            if last_valid_poly_data and poly_fetch_failures < 5:
+                                console.print("[dim]Using cached Polymarket data[/dim]")
+                                poly = last_valid_poly_data
                     except Exception as e:
+                        poly_fetch_failures += 1
                         console.print(f"[yellow]Warning: Polymarket fetch failed: {e}[/yellow]")
-                        poly = {"ok": False, "reason": "fetch_error"}
+                        # Use cached data if available
+                        if last_valid_poly_data and poly_fetch_failures < 5:
+                            console.print("[dim]Using cached Polymarket data[/dim]")
+                            poly = last_valid_poly_data
+                        else:
+                            import traceback
+                            console.print(f"[dim]{traceback.format_exc()[-300:]}[/dim]")
+                            poly = {"ok": False, "reason": "fetch_error"}
 
                     # Process data
                     candles = klines_1m
@@ -399,7 +452,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     # Time awareness
                     settlement_ms = None
                     if poly.get("ok") and poly.get("market", {}).get("endDate"):
-                        from datetime import datetime
+                        from datetime import datetime, timezone
                         try:
                             settlement_ms = int(datetime.fromisoformat(
                                 poly["market"]["endDate"].replace("Z", "+00:00")
@@ -439,12 +492,45 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     if rec.get("action") == "ENTER":
                         if rec.get("side") == "UP":
                             signal_stats["upSignals"] += 1
+                            # Record signal history
+                            signals_history.append({
+                                "direction": "up",
+                                "up_price": market_up,
+                                "down_price": market_down,
+                                "remaining_time": int(time_left_min * 60) if time_left_min is not None else None,
+                                "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+                            })
                         if rec.get("side") == "DOWN":
                             signal_stats["downSignals"] += 1
+                            # Record signal history
+                            signals_history.append({
+                                "direction": "down",
+                                "up_price": market_up,
+                                "down_price": market_down,
+                                "remaining_time": int(time_left_min * 60) if time_left_min is not None else None,
+                                "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+                            })
 
                     # KEY: Current price from Chainlink (matching JS: currentPrice = chainlink?.price ?? null)
                     current_price = chainlink_data.get("price")
                     current_price_timestamp = chainlink_data.get("updatedAt")
+
+                    # Fallback to last valid price if current is None (with limit)
+                    if current_price is None:
+                        if last_valid_current_price is not None and consecutive_price_failures < 10:
+                            current_price = last_valid_current_price
+                            consecutive_price_failures += 1
+                            if consecutive_price_failures == 1:
+                                console.print("[yellow]Using cached current price due to fetch failure[/yellow]")
+                        else:
+                            consecutive_price_failures += 1
+                            if consecutive_price_failures % 5 == 1:  # Log every 5th failure
+                                console.print(f"[red]Error: No current price available for {consecutive_price_failures} cycles[/red]")
+                    else:
+                        # Update cache when we have valid data
+                        if last_valid_current_price != current_price:
+                            last_valid_current_price = float(current_price)
+                        consecutive_price_failures = 0
 
                     # Spot price from Binance (matching JS: spotPrice = wsPrice ?? lastPrice)
                     spot_price = ws_price if ws_price is not None else last_price
@@ -459,11 +545,16 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     explicit_price_to_beat = None
                     if poly.get("ok") and poly.get("market"):
                         explicit_price_to_beat = price_to_beat_from_polymarket_market(poly["market"])
+                        # Debug logging
+                        if explicit_price_to_beat is None:
+                            console.print(f"[dim]Debug: No explicit price_to_beat found in market data for {market_slug}[/dim]")
+                            console.print(f"[dim]  Market keys: {list(poly.get('market', {}).keys())[:10]}[/dim]")
 
                     # Market switch detection
                     if market_slug and price_to_beat_state["slug"] != market_slug:
                         # Reset signal stats on market switch
                         signal_stats = {"marketSlug": market_slug, "upSignals": 0, "downSignals": 0}
+                        signals_history = []  # Reset signals history on market switch
 
                         # Inherit price from previous market end
                         inherited_price = None
@@ -512,6 +603,22 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     price_to_beat = explicit_price_to_beat or (
                         price_to_beat_state["value"] if price_to_beat_state["slug"] == market_slug else None
                     )
+
+                    # Final fallback: if still None and we have current_price, use it as price_to_beat
+                    if price_to_beat is None and current_price is not None and price_to_beat_state["value"] is None:
+                        # Only do this for the first time for this market
+                        if price_to_beat_state["slug"] != market_slug:
+                            price_to_beat = float(current_price)
+                            price_to_beat_state = {
+                                "slug": market_slug,
+                                "value": float(current_price),
+                                "setAtMs": int(time.time() * 1000)
+                            }
+                            console.print(f"[cyan]Setting initial price_to_beat to current price: ${current_price:.2f}[/cyan]")
+
+                    # Debug logging for price to beat
+                    if price_to_beat is None:
+                        console.print(f"[dim]Debug price_to_beat: explicit={explicit_price_to_beat}, state_slug={price_to_beat_state['slug']}, market_slug={market_slug}, state_value={price_to_beat_state['value']}[/dim]")
 
                     # Format output
                     p_long = time_aware.get("adjustedUp")
@@ -614,6 +721,42 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     panel = display.render(display_data)
                     live.update(panel)
 
+                    # Check for market switch and save previous market if ended
+                    if _last_market_data is not None and _last_market_data.get("marketSlug") != market_slug:
+                        prev_slug = _last_market_data.get("marketSlug")
+                        prev_end_str = _last_market_data.get("_endDate", "")
+
+                        # Check if previous market ended
+                        if prev_end_str:
+                            from datetime import datetime
+                            try:
+                                prev_settlement_ms = int(datetime.fromisoformat(prev_end_str.replace("Z", "+00:00")).timestamp() * 1000)
+                                now_ms = int(time.time() * 1000)
+                                prev_ended = prev_settlement_ms <= now_ms
+
+                                if prev_ended and prev_slug not in saved_market_slugs:
+                                    console.print(f"[dim][green]✓[/green] Snapshot saved for: {prev_slug[:30]}...[/dim]")
+                                    if db:
+                                        try:
+                                            await db.save_snapshot(_last_market_data, coin, interval)
+                                            saved_market_slugs.add(prev_slug)
+
+                                            # Store previous market end info for inheritance
+                                            previous_market_end_info = {
+                                                "slug": prev_slug,
+                                                "endMs": prev_settlement_ms
+                                            }
+                                        except Exception as e:
+                                            console.print(f"[yellow]Warning: Failed to save snapshot: {e}[/yellow]")
+                            except:
+                                pass
+
+                    # Store current market data for next iteration (add endDate and signals history for later use)
+                    current_market_data = display_data.copy()
+                    current_market_data["_endDate"] = poly.get("market", {}).get("endDate") if poly.get("ok") else None
+                    current_market_data["signalsHistory"] = signals_history.copy()  # Include signals history
+                    _last_market_data = current_market_data
+
                     # Update previous values
                     prev_spot_price = spot_price
                     prev_current_price = current_price
@@ -635,6 +778,12 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
         await polymarket_live_stream.close()
         if chainlink_stream:
             await chainlink_stream.close()
+        # Close database
+        if db:
+            try:
+                await close_db()
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to close database: {e}[/yellow]")
 
 
 def run_panel(coin: str = "BTC", interval: str = "5m"):
