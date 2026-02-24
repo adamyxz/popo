@@ -12,7 +12,7 @@ from rich.columns import Columns
 
 from .config import get_config
 from .utils import (
-    format_number, format_pct, fmt_time_left, get_candle_window_timing,
+    format_number, format_pct, fmt_time_left, fmt_progress_bar, get_candle_window_timing,
     async_sleep_ms, price_to_beat_from_polymarket_market, format_signed_delta,
     narrative_from_sign, narrative_from_rsi, narrative_from_slope, format_prob_pct,
     parse_price_to_beat, extract_numeric_from_market
@@ -165,7 +165,7 @@ class PanelDisplay:
 
 {current_price_line}
 
-[bold yellow]TIME LEFT: {time_left}[/bold yellow]"""
+[bold yellow]TIME LEFT:[/bold yellow] {time_left}"""
 
         # Indicators section
         indicators_text = f"""[bold cyan]Indicators[/bold cyan]
@@ -606,7 +606,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         "priceToBeat": price_to_beat,
                         "currentPriceLine": f"[{current_price_color}]CURRENT PRICE: ${format_number(current_price, 2)} ({ptb_delta_text})[/{current_price_color}]",
                         "polyHeader": f"UP [green]{format_number(market_up * 100, 0) if market_up else 0}c[/green] | DOWN [red]{format_number(market_down * 100, 0) if market_down else 0}c[/red]",
-                        "timeLeft": fmt_time_left(time_left_min),
+                        "timeLeft": fmt_progress_bar(time_left_min, config["candle_window_minutes"]),
                         "binanceSpot": f"BTC (Binance): ${format_number(spot_price, 0)}",
                     }
 

@@ -65,6 +65,37 @@ def fmt_time_left(mins: Optional[float]) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def fmt_progress_bar(mins: Optional[float], total_mins: float = 5.0) -> str:
+    """Format time left as a progress bar."""
+    if mins is None:
+        return "[dim]━━━━━━━━━━━[/dim]"
+
+    # Clamp between 0 and total
+    remaining = max(0, min(mins, total_mins))
+    elapsed = total_mins - remaining
+    progress = elapsed / total_mins
+
+    # Calculate filled segments (11 segments total)
+    total_segments = 11
+    filled = int(progress * total_segments)
+
+    # Build bar
+    bar = ""
+    for i in range(total_segments):
+        if i < filled:
+            bar += "█"
+        else:
+            bar += "░"
+
+    # Format remaining time only
+    remaining_mins = int(remaining)
+    remaining_secs = int((remaining - remaining_mins) * 60)
+
+    time_str = f"{remaining_mins:01d}:{remaining_secs:02d}"
+
+    return f"[cyan]{bar}[/cyan] [yellow]{time_str}[/yellow]"
+
+
 def fmt_et_time() -> str:
     """Format current ET time."""
     from datetime import datetime, timezone, timedelta
