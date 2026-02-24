@@ -291,6 +291,199 @@ class Database:
 
             return [dict(row) for row in rows]
 
+    async def get_snapshots_stats(self):
+        """Get comprehensive statistics about snapshots.
+
+        Returns:
+            Dictionary with statistics including:
+            - total_count: Total number of snapshots
+            - up_count: Count where current_price > price_to_beat
+            - down_count: Count where current_price < price_to_beat
+            - correct_count: Total correct predictions
+            - correct_rate: Overall accuracy rate
+            - up_correct_count: UP predictions that were correct
+            - up_correct_rate: UP prediction accuracy rate
+            - down_correct_count: DOWN predictions that were correct
+            - down_correct_rate: DOWN prediction accuracy rate
+            - up_entry_time_range: Optimal entry time range for UP (in seconds from start)
+            - down_entry_time_range: Optimal entry time range for DOWN (in seconds from start)
+        """
+        if not self.pool:
+            raise RuntimeError("Database not initialized. Call init() first.")
+
+        async with self.pool.acquire() as conn:
+            # Get all snapshots with relevant fields
+            rows = await conn.fetch("""
+                SELECT id, price_to_beat, current_price, signal_stats, signals_history, timestamp
+                FROM snapshots
+                ORDER BY timestamp ASC
+            """)
+
+            # Count all snapshots (including those without signals)
+            total_count = len(rows)
+
+            # Track counts with signals only
+            up_with_signal = 0
+            down_with_signal = 0
+            up_correct_count = 0
+            down_correct_count = 0
+
+            # Store signal times for correct predictions
+            up_signal_times = []  # List of seconds from snapshot timestamp
+            down_signal_times = []
+
+            for row in rows:
+                # Determine direction
+                if row['current_price'] and row['price_to_beat']:
+                    if row['current_price'] > row['price_to_beat']:
+                        direction = 'up'
+                    elif row['current_price'] < row['price_to_beat']:
+                        direction = 'down'
+                    else:
+                        direction = 'neutral'
+                else:
+                    continue
+
+                # Parse signal stats to determine sentiment
+                import json
+                signal_stats = row['signal_stats']
+                if isinstance(signal_stats, str):
+                    signal_stats = json.loads(signal_stats)
+
+                up_signals = signal_stats.get('up', 0) if signal_stats else 0
+                down_signals = signal_stats.get('down', 0) if signal_stats else 0
+
+                # Skip if no signals (up=0 and down=0 means no prediction)
+                if up_signals == 0 and down_signals == 0:
+                    continue
+
+                if up_signals > down_signals:
+                    sentiment = 'bullish'
+                elif down_signals > up_signals:
+                    sentiment = 'bearish'
+                else:
+                    sentiment = 'neutral'
+
+                # Count directions for snapshots with signals
+                if direction == 'up':
+                    up_with_signal += 1
+                elif direction == 'down':
+                    down_with_signal += 1
+
+                # Check if prediction was correct
+                is_correct = (direction == 'up' and sentiment == 'bullish') or \
+                             (direction == 'down' and sentiment == 'bearish')
+
+                if is_correct:
+                    if direction == 'up':
+                        up_correct_count += 1
+                        # Collect signal times for UP
+                        signals_history = row['signals_history']
+                        if signals_history:
+                            if isinstance(signals_history, str):
+                                signals_history = json.loads(signals_history)
+                            snapshot_time = row['timestamp']
+                            # Ensure snapshot_time is timezone-aware
+                            if snapshot_time.tzinfo is None:
+                                from datetime import timezone
+                                snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+                            for sig in signals_history:
+                                if sig.get('direction') == 'up':
+                                    sig_time = sig.get('timestamp')
+                                    if sig_time:
+                                        from datetime import datetime
+                                        if isinstance(sig_time, str):
+                                            sig_dt = datetime.fromisoformat(sig_time.replace('Z', '+00:00'))
+                                        else:
+                                            sig_dt = sig_time
+                                        # Ensure sig_dt is timezone-aware
+                                        if sig_dt.tzinfo is None:
+                                            from datetime import timezone
+                                            sig_dt = sig_dt.replace(tzinfo=timezone.utc)
+                                        # Calculate seconds from snapshot start
+                                        delta = snapshot_time - sig_dt
+                                        # Signals happen before snapshot, so we want how long before
+                                        # Store absolute seconds (e.g., 60 seconds before = 60)
+                                        up_signal_times.append(abs(int(delta.total_seconds())))
+
+                    elif direction == 'down':
+                        down_correct_count += 1
+                        # Collect signal times for DOWN
+                        signals_history = row['signals_history']
+                        if signals_history:
+                            if isinstance(signals_history, str):
+                                signals_history = json.loads(signals_history)
+                            snapshot_time = row['timestamp']
+                            # Ensure snapshot_time is timezone-aware
+                            if snapshot_time.tzinfo is None:
+                                from datetime import timezone
+                                snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+                            for sig in signals_history:
+                                if sig.get('direction') == 'down':
+                                    sig_time = sig.get('timestamp')
+                                    if sig_time:
+                                        from datetime import datetime
+                                        if isinstance(sig_time, str):
+                                            sig_dt = datetime.fromisoformat(sig_time.replace('Z', '+00:00'))
+                                        else:
+                                            sig_dt = sig_time
+                                        # Ensure sig_dt is timezone-aware
+                                        if sig_dt.tzinfo is None:
+                                            from datetime import timezone
+                                            sig_dt = sig_dt.replace(tzinfo=timezone.utc)
+                                        delta = snapshot_time - sig_dt
+                                        down_signal_times.append(abs(int(delta.total_seconds())))
+
+            # Calculate optimal entry time ranges
+            # Use interquartile range (IQR) method to find typical signal timing
+            def calculate_time_range(times):
+                if not times:
+                    return {
+                        "min": 0,
+                        "max": 0,
+                        "optimal_min": 0,
+                        "optimal_max": 0,
+                        "median": 0,
+                        "sample_size": 0
+                    }
+                sorted_times = sorted(times)
+                n = len(sorted_times)
+                # Use 25th to 75th percentile as optimal range
+                q25_idx = int(n * 0.25)
+                q75_idx = int(n * 0.75)
+                return {
+                    "min": sorted_times[0],
+                    "max": sorted_times[-1],
+                    "optimal_min": sorted_times[q25_idx],
+                    "optimal_max": sorted_times[q75_idx],
+                    "median": sorted_times[n // 2],
+                    "sample_size": n
+                }
+
+            up_entry_time_range = calculate_time_range(up_signal_times)
+            down_entry_time_range = calculate_time_range(down_signal_times)
+
+            # Calculate rates (only for snapshots with signals)
+            with_signal_count = up_with_signal + down_with_signal
+            correct_count = up_correct_count + down_correct_count
+            correct_rate = (correct_count / with_signal_count * 100) if with_signal_count > 0 else 0
+            up_correct_rate = (up_correct_count / up_with_signal * 100) if up_with_signal > 0 else 0
+            down_correct_rate = (down_correct_count / down_with_signal * 100) if down_with_signal > 0 else 0
+
+            return {
+                "total_count": total_count,
+                "up_count": up_with_signal,
+                "down_count": down_with_signal,
+                "correct_count": correct_count,
+                "correct_rate": round(correct_rate, 2),
+                "up_correct_count": up_correct_count,
+                "up_correct_rate": round(up_correct_rate, 2),
+                "down_correct_count": down_correct_count,
+                "down_correct_rate": round(down_correct_rate, 2),
+                "up_entry_time_range": up_entry_time_range,
+                "down_entry_time_range": down_entry_time_range
+            }
+
     async def close(self):
         """Close database connection pool."""
         if self.pool:
@@ -303,9 +496,12 @@ _db: Optional[Database] = None
 
 
 async def get_db() -> Database:
-    """Get or create global database instance."""
+    """Get or create global database instance.
+
+    Returns a valid database connection, creating a new one if needed.
+    """
     global _db
-    if _db is None:
+    if _db is None or _db.pool is None:
         _db = Database()
         await _db.init()
     return _db

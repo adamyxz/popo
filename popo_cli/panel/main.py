@@ -233,12 +233,16 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
     # Initialize database
     from ..db import get_db, close_db
+    db = None
     try:
         db = await get_db()
-        console.print("[dim]Database connected[/dim]")
+        # Test the connection
+        async with db.pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        console.print("[green]✓[/green] Database connected - snapshots will be saved automatically")
     except Exception as e:
         console.print(f"[yellow]Warning: Database connection failed: {e}[/yellow]")
-        console.print("[dim]Snapshots will not be saved[/dim]")
+        console.print("[dim]Snapshots will not be saved. Run 'popo init-db' to set up the database.[/dim]")
         db = None
 
     # Start WebSocket streams (matching JS version)
@@ -722,7 +726,12 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     live.update(panel)
 
                     # Check for market switch and save previous market if ended
-                    if _last_market_data is not None and _last_market_data.get("marketSlug") != market_slug:
+                    # Only save if: 1) we have previous market data, 2) market slug actually changed, 3) previous slug is valid
+                    if (_last_market_data is not None and
+                        _last_market_data.get("marketSlug") and
+                        _last_market_data.get("marketSlug") != market_slug and
+                        market_slug):  # Current slug is also valid (not empty)
+
                         prev_slug = _last_market_data.get("marketSlug")
                         prev_end_str = _last_market_data.get("_endDate", "")
 
@@ -735,11 +744,11 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                                 prev_ended = prev_settlement_ms <= now_ms
 
                                 if prev_ended and prev_slug not in saved_market_slugs:
-                                    console.print(f"[dim][green]✓[/green] Snapshot saved for: {prev_slug[:30]}...[/dim]")
                                     if db:
                                         try:
                                             await db.save_snapshot(_last_market_data, coin, interval)
                                             saved_market_slugs.add(prev_slug)
+                                            console.print(f"[green]✓[/green] Snapshot saved for: [cyan]{prev_slug[:40]}...[/cyan]")
 
                                             # Store previous market end info for inheritance
                                             previous_market_end_info = {
@@ -747,15 +756,19 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                                                 "endMs": prev_settlement_ms
                                             }
                                         except Exception as e:
-                                            console.print(f"[yellow]Warning: Failed to save snapshot: {e}[/yellow]")
-                            except:
-                                pass
+                                            console.print(f"[yellow]Warning: Failed to save snapshot for {prev_slug[:30]}: {e}[/yellow]")
+                                    else:
+                                        console.print(f"[dim]Skipping snapshot save (database not connected)[/dim]")
+                            except Exception as e:
+                                console.print(f"[dim]Error processing market switch: {e}[/dim]")
 
                     # Store current market data for next iteration (add endDate and signals history for later use)
-                    current_market_data = display_data.copy()
-                    current_market_data["_endDate"] = poly.get("market", {}).get("endDate") if poly.get("ok") else None
-                    current_market_data["signalsHistory"] = signals_history.copy()  # Include signals history
-                    _last_market_data = current_market_data
+                    # ONLY update if we have a valid market slug
+                    if market_slug:
+                        current_market_data = display_data.copy()
+                        current_market_data["_endDate"] = poly.get("market", {}).get("endDate") if poly.get("ok") else None
+                        current_market_data["signalsHistory"] = signals_history.copy()  # Include signals history
+                        _last_market_data = current_market_data
 
                     # Update previous values
                     prev_spot_price = spot_price

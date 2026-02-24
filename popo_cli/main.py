@@ -300,6 +300,12 @@ def migrate_snapshots() -> None:
 
 
 @app.command()
+def snapshot_stats() -> None:
+    """Show snapshot statistics and prediction analysis."""
+    handle_snapshots_command()
+
+
+@app.command()
 def cleanup_db() -> None:
     """Remove deprecated columns (time_left, raw_data) from database."""
     async def _cleanup():
@@ -388,6 +394,103 @@ def handle_panel_command(args: str = "") -> None:
         console.print(f"[red]Error starting panel: {e}[/red]")
 
 
+def handle_snapshots_command() -> None:
+    """Handle the /snapshots command to show statistics."""
+    async def _show_stats():
+        from .db import get_db
+        try:
+            db = await get_db()
+            stats = await db.get_snapshots_stats()
+
+            from rich.table import Table
+            from rich.panel import Panel
+
+            # Summary table
+            summary_table = Table(title="[bold cyan]Snapshot Statistics Summary[/bold cyan]", show_header=False)
+            summary_table.add_column("Metric", style="cyan")
+            summary_table.add_column("Value", style="yellow")
+
+            summary_table.add_row("Total Snapshots", str(stats["total_count"]))
+            summary_table.add_row("UP Count", str(stats["up_count"]))
+            summary_table.add_row("DOWN Count", str(stats["down_count"]))
+
+            console.print("\n")
+            console.print(summary_table)
+
+            # Prediction accuracy table
+            accuracy_table = Table(title="[bold green]Prediction Accuracy[/bold green]")
+            accuracy_table.add_column("Metric", style="cyan")
+            accuracy_table.add_column("Count", justify="right")
+            accuracy_table.add_column("Rate", justify="right")
+
+            accuracy_table.add_row(
+                "Overall Correct",
+                str(stats["correct_count"]),
+                f"{stats['correct_rate']}%"
+            )
+            accuracy_table.add_row(
+                "UP Correct",
+                str(stats["up_correct_count"]),
+                f"[green]{stats['up_correct_rate']}%[/green]" if stats['up_correct_rate'] > 50 else f"[red]{stats['up_correct_rate']}%[/red]"
+            )
+            accuracy_table.add_row(
+                "DOWN Correct",
+                str(stats["down_correct_count"]),
+                f"[green]{stats['down_correct_rate']}%[/green]" if stats['down_correct_rate'] > 50 else f"[red]{stats['down_correct_rate']}%[/red]"
+            )
+
+            console.print("\n")
+            console.print(accuracy_table)
+
+            # Optimal entry time ranges
+            time_table = Table(title="[bold magenta]Optimal Entry Time Range[/bold magenta] (seconds before snapshot)")
+            time_table.add_column("Direction", style="cyan")
+            time_table.add_column("Min", justify="right")
+            time_table.add_column("Optimal Range", justify="center")
+            time_table.add_column("Max", justify="right")
+            time_table.add_column("Median", justify="right")
+            time_table.add_column("Samples", justify="right")
+
+            up_range = stats["up_entry_time_range"]
+            down_range = stats["down_entry_time_range"]
+
+            if up_range["sample_size"] > 0:
+                time_table.add_row(
+                    "UP",
+                    f"{up_range['min']}s",
+                    f"{up_range['optimal_min']}s - {up_range['optimal_max']}s",
+                    f"{up_range['max']}s",
+                    f"{up_range['median']}s",
+                    str(up_range["sample_size"])
+                )
+            else:
+                time_table.add_row("UP", "[dim]-[/dim]", "[dim]N/A (no data)[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]")
+
+            if down_range["sample_size"] > 0:
+                time_table.add_row(
+                    "DOWN",
+                    f"{down_range['min']}s",
+                    f"{down_range['optimal_min']}s - {down_range['optimal_max']}s",
+                    f"{down_range['max']}s",
+                    f"{down_range['median']}s",
+                    str(down_range["sample_size"])
+                )
+            else:
+                time_table.add_row("DOWN", "[dim]-[/dim]", "[dim]N/A (no data)[/dim]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]0[/dim]")
+
+            console.print("\n")
+            console.print(time_table)
+            console.print("\n[dim]Optimal Range: 25th-75th percentile of successful entry times[/dim]")
+
+            await db.close()
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            import traceback
+            traceback.print_exc()
+
+    asyncio.run(_show_stats())
+
+
 def handle_command(command: str) -> bool:
     """Handle a user command.
 
@@ -404,6 +507,8 @@ def handle_command(command: str) -> bool:
         return False
     elif command == "/help":
         show_help()
+    elif command == "/snapshots":
+        handle_snapshots_command()
     elif command.startswith("/panel"):
         parts = command.split(maxsplit=1)
         args = parts[1] if len(parts) > 1 else ""
@@ -421,11 +526,12 @@ def show_help() -> None:
     help_text = """
 [bold cyan]Available Commands:[/bold cyan]
 
-  [bold]/hi[/bold]     - Say hi
+  [bold]/hi[/bold]        - Say hi
+  [bold]/snapshots[/bold] - Show snapshot statistics and predictions
   [bold]/panel[/bold] [coin] [interval] - Start trading panel (e.g., /panel BTC 5m)
-  [bold]/help[/bold]   - Show this help message
-  [bold]/exit[/bold]   - Exit the CLI
-  [bold]/quit[/bold]   - Exit the CLI
+  [bold]/help[/bold]      - Show this help message
+  [bold]/exit[/bold]      - Exit the CLI
+  [bold]/quit[/bold]      - Exit the CLI
 
 [bold cyan]Panel Options:[/bold cyan]
   [dim]Coins: BTC, ETH, SOL[/dim]
@@ -442,6 +548,7 @@ def show_help() -> None:
   [dim]popo test-snapshot[/dim]      - Test saving a snapshot
   [dim]popo snapshots[/dim]          - Show saved snapshots
   [dim]popo snapshots -m MARKET_SLUG[/dim] - Filter by market
+  [dim]popo snapshot-stats[/dim]     - Show snapshot statistics and prediction analysis
   [dim]popo migrate-snapshots[/dim]  - Migrate existing snapshots to new schema
   [dim]popo cleanup-db[/dim]         - Remove deprecated columns (time_left, raw_data)
 """
