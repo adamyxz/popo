@@ -3,12 +3,35 @@
 import asyncio
 import time
 import re
+import sys
+import warnings
 from typing import Optional, Dict, Any, List
 from rich.console import Console
 from rich.live import Live
 from rich.text import Text
 from rich.panel import Panel
 from rich.columns import Columns
+from rich.table import Table
+
+# Suppress websockets library internal errors
+warnings.filterwarnings("ignore", message=".*recv_messages.*")
+
+# Monkey patch to fix websockets compatibility issue
+try:
+    import websockets.asyncio.connection
+    original_connection_lost = websockets.asyncio.connection.ClientConnection.connection_lost
+
+    def patched_connection_lost(self, exc):
+        """Patched connection_lost that handles missing recv_messages."""
+        try:
+            return original_connection_lost(self, exc)
+        except AttributeError:
+            # recv_messages doesn't exist, just skip
+            pass
+
+    websockets.asyncio.connection.ClientConnection.connection_lost = patched_connection_lost
+except Exception:
+    pass  # If patching fails, continue without it
 
 from .config import get_config
 from .utils import (
@@ -26,6 +49,104 @@ from .data import (
     fetch_klines, fetch_last_price, fetch_chainlink_btc_usd, fetch_polymarket_snapshot,
     BinanceTradeStream, start_polymarket_chainlink_price_stream, start_chainlink_price_stream
 )
+
+# Import trading service
+from ..trading import get_trading_service, PlaceOrderRequest, OrderInfo
+
+
+class TradingState:
+    """Trading state for panel."""
+
+    def __init__(self):
+        self.cart_amount = 0  # Current cart amount (only one direction)
+        self.cart_direction = None  # "up" or "down" or None
+        self.open_orders: List[OrderInfo] = []
+        self.market_id = None
+        self.up_token_id = None
+        self.down_token_id = None
+        self.refresh_trigger = 0  # Increment to trigger refresh
+
+    def add_to_cart(self, direction: str, amount: int = 1):
+        """Add amount to cart. If direction changes, clear previous amount."""
+        if self.cart_direction is None:
+            # First selection
+            self.cart_direction = direction
+            self.cart_amount = amount
+        elif self.cart_direction == direction:
+            # Same direction, add amount
+            self.cart_amount += amount
+        else:
+            # Different direction, clear and set new
+            self.cart_direction = direction
+            self.cart_amount = amount
+        self.refresh_trigger += 1  # Trigger refresh
+
+    def clear_cart(self):
+        """Clear the cart (after placing order)."""
+        self.cart_amount = 0
+        self.cart_direction = None
+        self.refresh_trigger += 1  # Trigger refresh
+
+    async def place_order(self, trading_service):
+        """Place order based on cart contents."""
+        if not trading_service or not trading_service.is_configured():
+            return "Trading service not configured"
+
+        if self.cart_direction is None or self.cart_amount <= 0:
+            return "Cart is empty (use arrow keys to add amount)"
+
+        if not (self.market_id and (self.up_token_id or self.down_token_id)):
+            return "Waiting for market data..."
+
+        direction = self.cart_direction
+        amount = self.cart_amount
+        token_id = self.up_token_id if direction == "up" else self.down_token_id
+
+        request = PlaceOrderRequest(
+            market_id=self.market_id,
+            token_id=token_id,
+            direction=direction,
+            side="BUY",
+            amount_in_dollars=float(amount),
+        )
+
+        result = await trading_service.place_order(request)
+
+        if result.success:
+            # Clear cart after successful order
+            self.clear_cart()
+            # Refresh open orders
+            try:
+                self.open_orders = await trading_service.get_open_orders()
+            except Exception:
+                pass
+            return f"Order placed: {result.order_id}"
+        else:
+            return f"Order failed: {result.error}"
+
+    async def close_all(self, trading_service, console: Console):
+        """Close all positions."""
+        if not trading_service or not trading_service.is_configured():
+            console.print("[yellow]Trading service not configured[/yellow]")
+            return
+
+        if not self.open_orders:
+            console.print("[dim]No open orders to close[/dim]")
+            return
+
+        console.print(f"[cyan]Closing {len(self.open_orders)} order(s)...[/cyan]")
+        results = await trading_service.close_all_orders()
+        for result in results:
+            if result.success:
+                console.print(f"[green]✓ Closed {result.order_id}[/green]")
+            else:
+                console.print(f"[red]✗ Failed to close {result.order_id}: {result.error}[/red]")
+
+        # Refresh open orders
+        try:
+            self.open_orders = await trading_service.get_open_orders()
+        except Exception:
+            pass
 
 
 def count_vwap_crosses(closes: List[float], vwap_series: List[Optional[float]], lookback: int) -> Optional[int]:
@@ -50,6 +171,54 @@ class PanelDisplay:
 
     def __init__(self, console: Console):
         self.console = console
+
+    def render_trading_panel(self, trading_state: 'TradingState') -> Panel:
+        """Render the trading panel at bottom."""
+        # Cart display
+        if trading_state.cart_direction == "up":
+            cart_color = "green"
+            cart_label = "UP"
+            cart_amount_str = f"[bold {cart_color}]${trading_state.cart_amount}[/bold {cart_color}]"
+        elif trading_state.cart_direction == "down":
+            cart_color = "red"
+            cart_label = "DOWN"
+            cart_amount_str = f"[bold {cart_color}]${trading_state.cart_amount}[/bold {cart_color}]"
+        else:
+            cart_color = "dim"
+            cart_label = "EMPTY"
+            cart_amount_str = "[dim]$0[/dim]"
+
+        # Count open orders by direction (only for current market)
+        if trading_state.market_id:
+            up_orders = [o for o in trading_state.open_orders
+                        if o.direction == "up" and o.status in ["matched", "open"] and o.market_id == trading_state.market_id]
+            down_orders = [o for o in trading_state.open_orders
+                         if o.direction == "down" and o.status in ["matched", "open"] and o.market_id == trading_state.market_id]
+        else:
+            up_orders = []
+            down_orders = []
+
+        up_pnl = sum(o.pnl or 0 for o in up_orders)
+        down_pnl = sum(o.pnl or 0 for o in down_orders)
+
+        up_pnl_str = f"[green]+${up_pnl:.2f}[/green]" if up_pnl > 0 else f"[red]${up_pnl:.2f}[/red]" if up_pnl < 0 else "[dim]$0.00[/dim]"
+        down_pnl_str = f"[green]+${down_pnl:.2f}[/green]" if down_pnl > 0 else f"[red]${down_pnl:.2f}[/red]" if down_pnl < 0 else "[dim]$0.00[/dim]"
+
+        # Build trading panel content
+        content = f"""[bold cyan]━━━ Trading Panel ━━━[/bold cyan]
+
+[dim]━━━ Cart ━━━[/dim]
+  Direction: [{cart_color}]{cart_label}[/{cart_color}]
+  Amount: {cart_amount_str}
+
+[dim]━━━ Open Positions ━━━[/dim]
+[bold green]UP:[/bold green] {len(up_orders)} orders | P&L: {up_pnl_str}
+[bold red]DOWN:[/bold red] {len(down_orders)} orders | P&L: {down_pnl_str}
+
+[dim]━━━ Controls ━━━[/dim]
+[dim]← UP | → DOWN | Enter: Buy | Space: Sell All | q: Quit[/dim]"""
+
+        return Panel(content, border_style="bright_yellow", padding=(0, 1))
 
     def render(self, data: Dict[str, Any]) -> Panel:
         """Render the panel display with new layout."""
@@ -140,34 +309,6 @@ class PanelDisplay:
         prediction_boxes = Columns([up_panel, down_panel], equal=True)
 
         # Build indicators section
-        indicators = f"""[bold cyan]Indicators[/bold cyan]
-  [bold]Signal:[/bold] [{signal_color}]{signal}[/{signal_color}] | {signal_stats}
-  [bold]Heiken Ashi:[/bold] {data.get("heikenAshi", "-")}
-  [bold]RSI:[/bold] {data.get("rsi", "-")}
-  [bold]MACD:[/bold] {data.get("macd", "-")}
-  [bold]Delta 1/3:[/bold] {data.get("delta", "-")}
-  [bold]VWAP:[/bold] {data.get("vwap", "-")}"""
-
-        # Add liquidity if available
-        liquidity = data.get("liquidity")
-        if liquidity:
-            indicators += f"\n  [bold]Liquidity:[/bold] {format_number(liquidity, 0)}"
-
-        # Add Binance spot
-        indicators += f"\n  [bold]Binance Spot:[/bold] {data.get('binanceSpot', '-')}"
-
-        # Build complete layout as renderables
-        # Top section
-        top_text = f"""[bold cyan]{title}[/bold cyan]
-[dim]Market: {market_slug}[/dim]
-
-[bold]PRICE TO BEAT:[/bold] {ptb_text}
-
-{current_price_line}
-
-[bold yellow]TIME LEFT:[/bold yellow] {time_left}"""
-
-        # Indicators section
         indicators_text = f"""[bold cyan]Indicators[/bold cyan]
   [bold]Signal:[/bold] [{signal_color}]{signal}[/{signal_color}] | {signal_stats}
   [bold]Heiken Ashi:[/bold] {data.get("heikenAshi", "-")}
@@ -184,9 +325,15 @@ class PanelDisplay:
         indicators_text += f"\n  [bold]Binance Spot:[/bold] {data.get('binanceSpot', '-')}"
         indicators_text += "\n\n[dim]created by Adam[/dim]"
 
-        # Create panels for text sections
-        top_panel_content = Panel(top_text, border_style="bright_blue", padding=(0, 1))
-        indicators_panel_content = Panel(indicators_text, border_style="bright_blue", padding=(0, 1))
+        # Build complete layout
+        top_text = f"""[bold cyan]{title}[/bold cyan]
+[dim]Market: {market_slug}[/dim]
+
+[bold]PRICE TO BEAT:[/bold] {ptb_text}
+
+{current_price_line}
+
+[bold yellow]TIME LEFT:[/bold yellow] {time_left}"""
 
         # Combine all in a Group
         from rich.console import Group
@@ -203,11 +350,32 @@ class PanelDisplay:
 
 
 async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
-    """Run panel async loop."""
+    """Run panel async loop with trading support."""
     console = Console()
     display = PanelDisplay(console)
 
     config = get_config(coin, interval)
+
+    # Initialize trading service
+    trading_service = None
+    trading_state = TradingState()
+    try:
+        trading_service = await get_trading_service()
+        if trading_service.is_configured():
+            console.print("[green]✓[/green] Trading service initialized")
+            # Load existing open orders
+            try:
+                trading_state.open_orders = await trading_service.get_open_orders()
+                if trading_state.open_orders:
+                    console.print(f"[dim]Found {len(trading_state.open_orders)} open order(s)[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to load open orders: {e}[/yellow]")
+        else:
+            console.print("[yellow]Warning: Trading service not configured[/yellow]")
+            console.print("[dim]Set POLYMARKET_PRIVATE_KEY in .env to enable trading[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: Failed to initialize trading service: {e}[/yellow]")
+        trading_service = None
 
     # Initialize state
     prev_spot_price = None
@@ -285,12 +453,96 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
     try:
         console.clear()
-        live = Live(console=console, refresh_per_second=1)
+        live = Live(console=console, refresh_per_second=10)  # Higher refresh rate
         live.start()
+
+        # Track last refresh trigger to detect changes
+        last_refresh_trigger = trading_state.refresh_trigger
+
+        # Create input task for key detection
+        async def key_handler():
+            """Handle keyboard input in background - single character mode."""
+            import sys
+            import tty
+            import termios
+            import os
+            import select
+
+            fd = sys.stdin.fileno()
+            old_settings = None
+
+            try:
+                # Save old settings
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+
+                while True:
+                    # Check if data available
+                    if select.select([fd], [], [], 0)[0]:
+                        try:
+                            # Read one character
+                            ch = os.read(fd, 1).decode('utf-8', errors='ignore')
+
+                            # Handle arrow keys (escape sequence)
+                            if ch == '\x1b':  # ESC
+                                # Wait a bit for next chars
+                                await asyncio.sleep(0.005)
+                                if select.select([fd], [], [], 0)[0]:
+                                    ch2 = os.read(fd, 1).decode('utf-8', errors='ignore')
+                                    if ch2 == '[':
+                                        await asyncio.sleep(0.005)
+                                        if select.select([fd], [], [], 0)[0]:
+                                            ch3 = os.read(fd, 1).decode('utf-8', errors='ignore')
+                                            if ch3 == 'D':  # Left arrow = UP
+                                                old_dir = trading_state.cart_direction
+                                                trading_state.add_to_cart("up", 1)
+                                                if old_dir and old_dir != "up":
+                                                    console.print("[yellow]← Switched to UP, cart cleared[/yellow]")
+                                                console.print(f"[green]← UP Cart: ${trading_state.cart_amount}[/green]")
+                                            elif ch3 == 'C':  # Right arrow = DOWN
+                                                old_dir = trading_state.cart_direction
+                                                trading_state.add_to_cart("down", 1)
+                                                if old_dir and old_dir != "down":
+                                                    console.print("[yellow]→ Switched to DOWN, cart cleared[/yellow]")
+                                                console.print(f"[red]→ DOWN Cart: ${trading_state.cart_amount}[/red]")
+                                continue
+
+                            # Handle other keys
+                            if ch in ('\r', '\n'):  # Enter
+                                result = await trading_state.place_order(trading_service)
+                                if result:
+                                    if "Order placed" in result:
+                                        console.print(f"[green]✓ {result}[/green]")
+                                    else:
+                                        console.print(f"[yellow]{result}[/yellow]")
+                            elif ch == ' ':  # Space
+                                await trading_state.close_all(trading_service, console)
+                            elif ch == '\x03' or ch == 'q':  # Ctrl+C or q
+                                raise KeyboardInterrupt
+
+                        except (OSError, IOError):
+                            break
+
+                    await asyncio.sleep(0.02)  # Small sleep to avoid busy loop
+
+            finally:
+                # Restore terminal settings
+                if old_settings:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        # Start key handler as background task
+        key_task = asyncio.create_task(key_handler())
 
         try:
             while True:
                 try:
+                    # Check if trading panel needs immediate refresh
+                    current_refresh_trigger = trading_state.refresh_trigger
+                    needs_immediate_refresh = (current_refresh_trigger != last_refresh_trigger)
+                    if needs_immediate_refresh:
+                        last_refresh_trigger = current_refresh_trigger
+
+                    # Get WebSocket prices (matching JS: wsTick, polymarketWsTick, chainlinkWsTick)
                     # Get WebSocket prices (matching JS: wsTick, polymarketWsTick, chainlinkWsTick)
                     ws_tick = binance_stream.get_last()
                     ws_price = ws_tick.get("price")
@@ -701,6 +953,45 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     else:
                         ptb_delta_text = "[dim]-[/dim]"
 
+                    # Update trading state with market info
+                    if poly.get("ok") and poly.get("market"):
+                        trading_state.market_id = poly["market"].get("id", "")
+                        # Get token IDs from poly response (already parsed by fetch_polymarket_snapshot)
+                        if poly.get("tokens"):
+                            trading_state.up_token_id = poly["tokens"].get("upTokenId")
+                            trading_state.down_token_id = poly["tokens"].get("downTokenId")
+
+                    # Update open orders P&L based on current prices
+                    # Filter orders: only show orders for current market
+                    up_orders_pnl = []
+                    down_orders_pnl = []
+                    if trading_service and trading_state.open_orders and trading_state.market_id:
+                        for order in trading_state.open_orders:
+                            # Skip orders that don't belong to current market
+                            if order.market_id != trading_state.market_id:
+                                continue
+
+                            if order.status in ["matched", "open"]:
+                                current_price_for_order = market_up if order.direction == "up" else market_down
+                                if order.price and current_price_for_order:
+                                    # P&L = (current_price - entry_price) * shares
+                                    pnl = (current_price_for_order - order.price) * (order.shares or 0)
+                                    pnl_percentage = ((current_price_for_order / order.price) - 1) * 100 if order.price > 0 else 0
+                                    order.pnl = pnl
+                                    order.pnl_percentage = pnl_percentage
+
+                                    order_dict = {
+                                        "order_id": order.order_id,
+                                        "price": order.price,
+                                        "shares": order.shares,
+                                        "pnl": pnl,
+                                        "pnl_percentage": pnl_percentage,
+                                    }
+                                    if order.direction == "up":
+                                        up_orders_pnl.append(order_dict)
+                                    else:
+                                        down_orders_pnl.append(order_dict)
+
                     # Build display data
                     display_data = {
                         "title": poly.get("market", {}).get("question", "-") if poly.get("ok") else "-",
@@ -721,9 +1012,13 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         "binanceSpot": f"BTC (Binance): ${format_number(spot_price, 0)}",
                     }
 
-                    # Update display
-                    panel = display.render(display_data)
-                    live.update(panel)
+                    # Render main panel and trading panel
+                    main_panel = display.render(display_data)
+                    trading_panel = display.render_trading_panel(trading_state)
+
+                    # Update display with both panels stacked
+                    from rich.console import Group
+                    live.update(Group(main_panel, trading_panel), refresh=True)  # Force refresh
 
                     # Check for market switch and save previous market if ended
                     # Only save if: 1) we have previous market data, 2) market slug actually changed, 3) previous slug is valid
@@ -731,6 +1026,15 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         _last_market_data.get("marketSlug") and
                         _last_market_data.get("marketSlug") != market_slug and
                         market_slug):  # Current slug is also valid (not empty)
+
+                        # Market switched - reset trading cart
+                        old_cart_amount = trading_state.cart_amount
+                        old_cart_direction = trading_state.cart_direction
+                        trading_state.clear_cart()
+                        trading_state.refresh_trigger += 1
+
+                        if old_cart_amount > 0:
+                            console.print(f"[yellow]Market switched - cart cleared ({old_cart_direction.upper()} ${old_cart_amount})[/yellow]")
 
                         prev_slug = _last_market_data.get("marketSlug")
                         prev_end_str = _last_market_data.get("_endDate", "")
@@ -779,10 +1083,20 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     import traceback
                     traceback.print_exc()
 
-                await async_sleep_ms(config["poll_interval_ms"])
+                # Dynamic sleep: short if cart changed, normal otherwise
+                if trading_state.refresh_trigger != last_refresh_trigger:
+                    await asyncio.sleep(0.05)  # Fast refresh after key press
+                else:
+                    await async_sleep_ms(config["poll_interval_ms"])
 
         finally:
             live.stop()
+            # Cancel key handler task
+            key_task.cancel()
+            try:
+                await key_task
+            except asyncio.CancelledError:
+                pass
 
     finally:
         await session.close()
