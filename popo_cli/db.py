@@ -5,6 +5,7 @@ import asyncio
 import json
 from datetime import datetime
 from typing import Optional, Dict, Any
+from decimal import Decimal, ROUND_HALF_UP
 import asyncpg
 from dotenv import load_dotenv
 
@@ -40,22 +41,21 @@ class Database:
                     coin VARCHAR(50),
                     interval VARCHAR(20),
                     timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    price_to_beat NUMERIC,
-                    current_price NUMERIC,
-                    ptb_delta NUMERIC,
+                    price_to_beat NUMERIC(20, 2),
+                    current_price NUMERIC(20, 2),
+                    ptb_delta NUMERIC(20, 2),
                     predict_value JSONB,
                     signal VARCHAR(50),
                     signal_stats JSONB,
                     heiken_ashi VARCHAR(100),
-                    rsi VARCHAR(100),
+                    rsi VARCHAR(50),
                     macd VARCHAR(100),
                     delta VARCHAR(100),
                     vwap VARCHAR(100),
-                    liquidity NUMERIC,
+                    vwap_slope VARCHAR(20),
+                    liquidity NUMERIC(20, 2),
                     poly_prices JSONB,
-                    time_left VARCHAR(100),
-                    binance_spot NUMERIC,
-                    raw_data JSONB,
+                    binance_spot NUMERIC(20, 2),
                     signals_history JSONB,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                 );
@@ -67,7 +67,7 @@ class Database:
                 ON snapshots(market_slug, timestamp DESC);
             """)
 
-            # Add signals_history column if it doesn't exist (for existing tables)
+            # Add columns for existing tables
             try:
                 await conn.execute("""
                     ALTER TABLE snapshots
@@ -75,6 +75,14 @@ class Database:
                 """)
             except Exception:
                 # Column might already exist or table is new
+                pass
+
+            try:
+                await conn.execute("""
+                    ALTER TABLE snapshots
+                    ADD COLUMN IF NOT EXISTS vwap_slope VARCHAR(20);
+                """)
+            except Exception:
                 pass
 
     def _remove_rich_tags(self, text: Any) -> str:
@@ -89,12 +97,16 @@ class Database:
         cleaned = re.sub(r'\[/?[^\]]+\]', '', text)
         return cleaned.strip()
 
-    def _round_numeric(self, value: Any, decimals: int = 2) -> Optional[float]:
-        """Round numeric value to specified decimals."""
+    def _round_numeric(self, value: Any, decimals: int = 2) -> Optional[Decimal]:
+        """Round numeric value to specified decimals using Decimal for precision."""
         if value is None:
             return None
         try:
-            return round(float(value), decimals)
+            # Convert to Decimal and round to exactly 2 decimal places
+            dec_value = Decimal(str(value))
+            # Create quantize string like '0.01' for 2 decimals
+            quantizer = Decimal('1').scaleb(-decimals)
+            return dec_value.quantize(quantizer, rounding=ROUND_HALF_UP)
         except (ValueError, TypeError):
             return None
 
@@ -129,9 +141,11 @@ class Database:
             up_match = re.search(r'UP[^\d]*(\d+)c', poly_header)
             down_match = re.search(r'DOWN[^\d]*(\d+)c', poly_header)
             if up_match:
-                poly_prices["up"] = round(float(up_match.group(1)) / 100, 2)
+                up_value = Decimal(up_match.group(1)) / Decimal('100')
+                poly_prices["up"] = float(up_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
             if down_match:
-                poly_prices["down"] = round(float(down_match.group(1)) / 100, 2)
+                down_value = Decimal(down_match.group(1)) / Decimal('100')
+                poly_prices["down"] = float(down_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
             # Parse predict value
             predict_value = display_data.get("predictValue", "")
@@ -163,20 +177,34 @@ class Database:
 
             # Clean Rich formatting tags from text fields
             heiken_ashi_clean = self._remove_rich_tags(display_data.get("heikenAshi"))
-            rsi_clean = self._remove_rich_tags(display_data.get("rsi"))
+
+            # RSI - extract pure number without arrow
+            rsi_raw = self._remove_rich_tags(display_data.get("rsi"))
+            rsi_clean = rsi_raw.split()[0] if rsi_raw else ""
+
             macd_clean = self._remove_rich_tags(display_data.get("macd"))
             delta_clean = self._remove_rich_tags(display_data.get("delta"))
-            vwap_clean = self._remove_rich_tags(display_data.get("vwap"))
-            time_left_clean = self._remove_rich_tags(display_data.get("timeLeft"))
+
+            # VWAP - extract value and slope separately
+            vwap_raw = self._remove_rich_tags(display_data.get("vwap"))
+            vwap_clean = vwap_raw.split("|")[0].strip() if vwap_raw else ""
+            # Extract slope from VWAP string (format: "value (pct) | slope: UP")
+            vwap_slope = ""
+            if vwap_raw and "slope:" in vwap_raw:
+                slope_part = vwap_raw.split("slope:")[1].strip()
+                vwap_slope = slope_part.split()[0] if slope_part else ""
 
             # Round prices in signals_history
             signals_history = display_data.get("signalsHistory", [])
             cleaned_signals_history = []
             for signal in signals_history:
+                up_price = signal.get("up_price")
+                down_price = signal.get("down_price")
+
                 cleaned_signal = {
                     "direction": signal.get("direction"),
-                    "up_price": self._round_numeric(signal.get("up_price"), 2),
-                    "down_price": self._round_numeric(signal.get("down_price"), 2),
+                    "up_price": float(Decimal(str(up_price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)) if up_price is not None else None,
+                    "down_price": float(Decimal(str(down_price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)) if down_price is not None else None,
                     "remaining_time": signal.get("remaining_time"),
                     "timestamp": signal.get("timestamp")
                 }
@@ -187,11 +215,11 @@ class Database:
                     market_slug, title, coin, interval,
                     price_to_beat, current_price, ptb_delta,
                     predict_value, signal, signal_stats,
-                    heiken_ashi, rsi, macd, delta, vwap,
-                    liquidity, poly_prices, time_left, binance_spot,
-                    raw_data, signals_history
+                    heiken_ashi, rsi, macd, delta, vwap, vwap_slope,
+                    liquidity, poly_prices, binance_spot,
+                    signals_history
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             """,
                 display_data.get("marketSlug"),
                 display_data.get("title"),
@@ -208,26 +236,25 @@ class Database:
                 macd_clean,
                 delta_clean,
                 vwap_clean,
+                vwap_slope,
                 liquidity,
                 json.dumps(poly_prices),
-                time_left_clean,
                 binance_spot,
-                json.dumps(display_data),  # Store raw data as JSONB
                 json.dumps(cleaned_signals_history),  # Store cleaned signals history as JSONB
             )
 
-    def _extract_price(self, price_str: Any) -> Optional[float]:
+    def _extract_price(self, price_str: Any) -> Optional[Decimal]:
         """Extract numeric price from display string."""
         if price_str is None:
             return None
-        if isinstance(price_str, (int, float)):
-            return float(price_str)
+        if isinstance(price_str, (int, float, Decimal)):
+            return Decimal(str(price_str))
         if isinstance(price_str, str):
             import re
             match = re.search(r'\$?([\d,]+\.?\d*)', price_str)
             if match:
                 try:
-                    return float(match.group(1).replace(',', ''))
+                    return Decimal(match.group(1).replace(',', ''))
                 except ValueError:
                     return None
         return None

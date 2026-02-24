@@ -88,7 +88,7 @@ def init_db() -> None:
         try:
             db = await get_db()
 
-            # Manually add signals_history column if needed
+            # Add columns for existing tables
             async with db.pool.acquire() as conn:
                 try:
                     await conn.execute("""
@@ -96,6 +96,15 @@ def init_db() -> None:
                         ADD COLUMN IF NOT EXISTS signals_history JSONB;
                     """)
                     console.print("[green]✓[/green] Added signals_history column")
+                except Exception as e:
+                    console.print(f"[yellow]Note: {e}[/yellow]")
+
+                try:
+                    await conn.execute("""
+                        ALTER TABLE snapshots
+                        ADD COLUMN IF NOT EXISTS vwap_slope VARCHAR(20);
+                    """)
+                    console.print("[green]✓[/green] Added vwap_slope column")
                 except Exception as e:
                     console.print(f"[yellow]Note: {e}[/yellow]")
 
@@ -163,6 +172,180 @@ def snapshots(market: str = typer.Option(None, "--market", "-m", help="Filter by
             traceback.print_exc()
 
     asyncio.run(_show())
+
+
+@app.command()
+def migrate_snapshots() -> None:
+    """Migrate existing snapshots to new schema format."""
+    async def _migrate():
+        from .db import get_db
+        from decimal import Decimal, ROUND_HALF_UP
+        console.print("[cyan]Migrating snapshots to new schema...[/cyan]")
+        try:
+            db = await get_db()
+
+            async with db.pool.acquire() as conn:
+                # Fetch all snapshots that need migration
+                rows = await conn.fetch("""
+                    SELECT id, rsi, vwap, signals_history, price_to_beat, current_price,
+                           ptb_delta, liquidity, binance_spot, poly_prices
+                    FROM snapshots
+                """)
+
+                migrated = 0
+                for row in rows:
+                    updates = []
+                    values = []
+                    param_count = 1
+
+                    # Migrate RSI - remove arrow
+                    if row["rsi"]:
+                        import re
+                        rsi_clean = re.sub(r'\s*[↑↓-]\s*', '', str(row["rsi"]))
+                        rsi_clean = db._remove_rich_tags(rsi_clean)
+                        # Extract just the number
+                        rsi_number = rsi_clean.split()[0] if rsi_clean else None
+                        if rsi_number and rsi_number != row["rsi"]:
+                            updates.append(f"rsi = ${param_count}")
+                            values.append(rsi_number)
+                            param_count += 1
+
+                    # Migrate VWAP - extract slope
+                    if row["vwap"] and not row.get("vwap_slope"):
+                        import re
+                        vwap_raw = db._remove_rich_tags(str(row["vwap"]))
+                        # Extract slope
+                        vwap_slope = ""
+                        if "slope:" in vwap_raw:
+                            slope_part = vwap_raw.split("slope:")[1].strip()
+                            vwap_slope = slope_part.split()[0] if slope_part else ""
+
+                        if vwap_slope:
+                            updates.append(f"vwap_slope = ${param_count}")
+                            values.append(vwap_slope)
+                            param_count += 1
+
+                    # Fix precision for numeric columns
+                    for col in ['price_to_beat', 'current_price', 'ptb_delta', 'liquidity', 'binance_spot']:
+                        if row.get(col) is not None:
+                            try:
+                                value = Decimal(str(row[col]))
+                                rounded = value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                                updates.append(f"{col} = ${param_count}")
+                                values.append(rounded)
+                                param_count += 1
+                            except:
+                                pass
+
+                    # Fix poly_prices precision
+                    if row.get("poly_prices"):
+                        import json
+                        try:
+                            prices = json.loads(row["poly_prices"]) if isinstance(row["poly_prices"], str) else row["poly_prices"]
+                            cleaned = {}
+                            for key, value in prices.items():
+                                if value is not None:
+                                    dec_value = Decimal(str(value))
+                                    cleaned[key] = float(dec_value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+                            if cleaned != prices:
+                                updates.append(f"poly_prices = ${param_count}")
+                                values.append(json.dumps(cleaned))
+                                param_count += 1
+                        except:
+                            pass
+
+                    # Clean signals_history prices to 2 decimal places
+                    if row["signals_history"]:
+                        import json
+                        try:
+                            signals_history = json.loads(row["signals_history"])
+                            cleaned = []
+                            for sig in signals_history:
+                                up_price = sig.get("up_price")
+                                down_price = sig.get("down_price")
+
+                                cleaned_sig = {
+                                    "direction": sig.get("direction"),
+                                    "up_price": float(Decimal(str(up_price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)) if up_price is not None else None,
+                                    "down_price": float(Decimal(str(down_price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)) if down_price is not None else None,
+                                    "remaining_time": sig.get("remaining_time"),
+                                    "timestamp": sig.get("timestamp")
+                                }
+                                cleaned.append(cleaned_sig)
+
+                            updates.append(f"signals_history = ${param_count}")
+                            values.append(json.dumps(cleaned))
+                            param_count += 1
+                        except:
+                            pass
+
+                    if updates:
+                        values.append(row["id"])
+                        await conn.execute(f"""
+                            UPDATE snapshots
+                            SET {', '.join(updates)}
+                            WHERE id = ${param_count}
+                        """, *values)
+                        migrated += 1
+
+                console.print(f"[green]✓[/green] Migrated {migrated} snapshot(s)")
+
+            await db.close()
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            import traceback
+            traceback.print_exc()
+
+    asyncio.run(_migrate())
+
+
+@app.command()
+def cleanup_db() -> None:
+    """Remove deprecated columns (time_left, raw_data) from database."""
+    async def _cleanup():
+        from .db import get_db
+        console.print("[yellow]Warning: This will permanently remove time_left and raw_data columns.[/yellow]")
+        console.print("[dim]These columns contain data that will be deleted.[/dim]")
+
+        from rich.prompt import Confirm
+        if not Confirm.ask("Do you want to continue?"):
+            console.print("[dim]Cleanup cancelled.[/dim]")
+            return
+
+        console.print("[cyan]Cleaning up database...[/cyan]")
+        try:
+            db = await get_db()
+
+            async with db.pool.acquire() as conn:
+                # Drop time_left column
+                try:
+                    await conn.execute("""
+                        ALTER TABLE snapshots
+                        DROP COLUMN IF EXISTS time_left;
+                    """)
+                    console.print("[green]✓[/green] Dropped time_left column")
+                except Exception as e:
+                    console.print(f"[yellow]Note: {e}[/yellow]")
+
+                # Drop raw_data column
+                try:
+                    await conn.execute("""
+                        ALTER TABLE snapshots
+                        DROP COLUMN IF EXISTS raw_data;
+                    """)
+                    console.print("[green]✓[/green] Dropped raw_data column")
+                except Exception as e:
+                    console.print(f"[yellow]Note: {e}[/yellow]")
+
+            console.print("[green]✓[/green] Database cleanup completed!")
+
+            await db.close()
+        except Exception as e:
+            console.print(f"[red]Error:[/red] {e}")
+            import traceback
+            traceback.print_exc()
+
+    asyncio.run(_cleanup())
 
 
 def handle_hi_command() -> None:
@@ -254,11 +437,13 @@ def show_help() -> None:
   [dim]/panel SOL 5m[/dim]     - Solana 5-minute panel
 
 [bold cyan]CLI Commands:[/bold cyan]
-  [dim]popo start[/dim]        - Start interactive CLI
-  [dim]popo init-db[/dim]      - Initialize database tables
-  [dim]popo test-snapshot[/dim] - Test saving a snapshot
-  [dim]popo snapshots[/dim]    - Show saved snapshots
+  [dim]popo start[/dim]              - Start interactive CLI
+  [dim]popo init-db[/dim]            - Initialize database tables
+  [dim]popo test-snapshot[/dim]      - Test saving a snapshot
+  [dim]popo snapshots[/dim]          - Show saved snapshots
   [dim]popo snapshots -m MARKET_SLUG[/dim] - Filter by market
+  [dim]popo migrate-snapshots[/dim]  - Migrate existing snapshots to new schema
+  [dim]popo cleanup-db[/dim]         - Remove deprecated columns (time_left, raw_data)
 """
     console.print(help_text)
 
