@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from typing import Optional, Dict, Any, Callable, List
 
 
@@ -53,6 +54,12 @@ class ChainlinkPriceStream:
         self._sub_id = None
         self._next_id = 1
 
+        # Connection health tracking
+        self._connected = False
+        self._last_data_time = None  # Last time we received valid data
+        self._connect_attempt_count = 0
+        self._last_alert_time = 0
+
     async def _connect(self):
         """Connect to WebSocket."""
         if self._closed or not self.wss_urls or not self.aggregator:
@@ -63,9 +70,16 @@ class ChainlinkPriceStream:
         url = self.wss_urls[self._url_index % len(self.wss_urls)]
         self._url_index += 1
 
+        self._connect_attempt_count += 1
+
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(
+                url,
+                ping_interval=30,
+                ping_timeout=30,
+            ) as ws:
                 self._ws = ws
+                self._connected = True
                 self._reconnect_ms = 500
 
                 # Subscribe to logs
@@ -125,6 +139,7 @@ class ChainlinkPriceStream:
 
                         self.last_price = price if __import__("math").isfinite(price) else self.last_price
                         self.last_updated_at = (updated_at * 1000) if updated_at is not None else self.last_updated_at
+                        self._last_data_time = time.time()
 
                         if self.on_update:
                             self.on_update({
@@ -136,10 +151,20 @@ class ChainlinkPriceStream:
                     except (ValueError, IndexError):
                         continue
 
-        except Exception:
+                # Connection closed normally
+                self._connected = False
+
+        except Exception as e:
+            self._connected = False
             if not self._closed:
+                # Alert on reconnect failures (but not on every attempt to avoid spam)
+                now = time.time()
+                if now - self._last_alert_time > 60:  # Alert at most once per minute
+                    print(f"[yellow]Chainlink WebSocket connection failed (attempt {self._connect_attempt_count}), reconnecting in {self._reconnect_ms}ms...[/yellow]")
+                    self._last_alert_time = now
+
                 await asyncio.sleep(self._reconnect_ms / 1000)
-                self._reconnect_ms = min(10000, int(self._reconnect_ms * 1.5))
+                self._reconnect_ms = min(30000, int(self._reconnect_ms * 1.5))
                 # Reconnect
                 self._task = asyncio.create_task(self._connect())
 
@@ -159,9 +184,30 @@ class ChainlinkPriceStream:
             "source": "chainlink_ws"
         }
 
+    def is_healthy(self, timeout_seconds: int = 120) -> bool:
+        """Check if the stream is healthy (receiving data within timeout).
+
+        Chainlink price updates are less frequent than Polymarket, so we use a longer timeout.
+        """
+        if self._last_data_time is None:
+            return False
+        return (time.time() - self._last_data_time) < timeout_seconds
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """Get connection status information."""
+        return {
+            "connected": self._connected,
+            "has_price": self.last_price is not None,
+            "last_data_age_seconds": time.time() - self._last_data_time if self._last_data_time else None,
+            "connect_attempts": self._connect_attempt_count,
+            "reconnect_delay_ms": self._reconnect_ms,
+            "subscribed": self._sub_id is not None
+        }
+
     async def close(self):
         """Close the stream."""
         self._closed = True
+        self._connected = False
 
         # Unsubscribe if connected
         if self._ws and self._sub_id:

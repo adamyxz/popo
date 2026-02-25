@@ -194,6 +194,45 @@ class OrderRepository:
                 return dict(row)
             return None
 
+    async def get_open_orders_by_market(self, market_id: str) -> List[Dict[str, Any]]:
+        """Get all open orders for a specific market."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT * FROM orders
+                WHERE market_id = $1
+                AND status IN ('matched', 'open', 'active', 'live', 'pending')
+                ORDER BY created_at DESC
+            """, market_id)
+            return [dict(row) for row in rows]
+
+    async def close_orders_for_market(
+        self,
+        market_id: str,
+        reason: str = "market_closed"
+    ) -> int:
+        """Close all open orders for a specific market when the market ends.
+
+        Returns the number of orders closed.
+        """
+        async with self.pool.acquire() as conn:
+            exit_data = {
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+                "market_ended": True
+            }
+            result = await conn.execute("""
+                UPDATE orders
+                SET status = 'market_closed',
+                    exit = $2,
+                    updated_at = NOW()
+                WHERE market_id = $1
+                AND status IN ('matched', 'open', 'active', 'live', 'pending')
+            """, market_id, json.dumps(exit_data))
+
+            # Parse "UPDATE n" result to get count
+            count = int(result.split()[-1]) if result else 0
+            return count
+
 
 # Global database pool
 _pool: Optional[asyncpg.Pool] = None

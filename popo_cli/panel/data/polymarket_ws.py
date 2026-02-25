@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from typing import Optional, Dict, Any, Callable
 
 
@@ -52,6 +53,12 @@ class PolymarketChainlinkStream:
         self._task = None
         self._reconnect_ms = 500
 
+        # Connection health tracking
+        self._connected = False
+        self._last_data_time = None  # Last time we received valid data
+        self._connect_attempt_count = 0
+        self._last_alert_time = 0
+
     async def _connect(self):
         """Connect to WebSocket."""
         if self._closed or not self.ws_url:
@@ -59,12 +66,17 @@ class PolymarketChainlinkStream:
 
         import websockets
 
+        self._connect_attempt_count += 1
+
         try:
             async with websockets.connect(
                 self.ws_url,
-                close_timeout=10
+                close_timeout=10,
+                ping_interval=20,  # Send ping every 20 seconds
+                ping_timeout=20,   # Wait for pong response
             ) as ws:
                 self._ws = ws
+                self._connected = True
                 self._reconnect_ms = 500
 
                 # Subscribe
@@ -120,6 +132,7 @@ class PolymarketChainlinkStream:
 
                     self.last_price = price
                     self.last_updated_at = updated_at_ms or self.last_updated_at
+                    self._last_data_time = time.time()
 
                     if self.on_update:
                         self.on_update({
@@ -128,10 +141,20 @@ class PolymarketChainlinkStream:
                             "source": "polymarket_ws"
                         })
 
-        except Exception:
+                # Connection closed normally (outside async for)
+                self._connected = False
+
+        except Exception as e:
+            self._connected = False
             if not self._closed:
+                # Alert on reconnect failures (but not on every attempt to avoid spam)
+                now = time.time()
+                if now - self._last_alert_time > 60:  # Alert at most once per minute
+                    print(f"[yellow]Polymarket WebSocket connection failed (attempt {self._connect_attempt_count}), reconnecting in {self._reconnect_ms}ms...[/yellow]")
+                    self._last_alert_time = now
+
                 await asyncio.sleep(self._reconnect_ms / 1000)
-                self._reconnect_ms = min(10000, int(self._reconnect_ms * 1.5))
+                self._reconnect_ms = min(30000, int(self._reconnect_ms * 1.5))
                 self._task = asyncio.create_task(self._connect())
 
     async def start(self):
@@ -148,9 +171,26 @@ class PolymarketChainlinkStream:
             "source": "polymarket_ws"
         }
 
+    def is_healthy(self, timeout_seconds: int = 60) -> bool:
+        """Check if the stream is healthy (receiving data within timeout)."""
+        if self._last_data_time is None:
+            return False
+        return (time.time() - self._last_data_time) < timeout_seconds
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """Get connection status information."""
+        return {
+            "connected": self._connected,
+            "has_price": self.last_price is not None,
+            "last_data_age_seconds": time.time() - self._last_data_time if self._last_data_time else None,
+            "connect_attempts": self._connect_attempt_count,
+            "reconnect_delay_ms": self._reconnect_ms
+        }
+
     async def close(self):
         """Close the stream."""
         self._closed = True
+        self._connected = False
         if self._task:
             self._task.cancel()
             try:

@@ -542,6 +542,44 @@ class PolymarketTradingService:
 
         return result
 
+    async def close_orders_for_market(self, market_id: str) -> Dict[str, Any]:
+        """Close all open orders for a specific market when it ends.
+
+        This updates the order status to 'market_closed' without attempting
+        to sell, since trading is no longer possible for ended markets.
+
+        Returns a dict with the count of orders closed and details.
+        """
+        if not self._order_repo:
+            return {"success": False, "error": "Order repository not initialized", "count": 0}
+
+        try:
+            # Get the orders that will be closed for logging
+            open_orders = await self._order_repo.get_open_orders_by_market(market_id)
+
+            # Close all orders for this market
+            count = await self._order_repo.close_orders_for_market(market_id, reason="market_ended")
+
+            logger.info(f"Closed {count} order(s) for market {market_id}")
+
+            return {
+                "success": True,
+                "count": count,
+                "market_id": market_id,
+                "orders": [
+                    {
+                        "order_id": o["order_id"],
+                        "side": o["side"],
+                        "direction": o["direction"],
+                        "value": o.get("value"),
+                    }
+                    for o in open_orders
+                ]
+            }
+        except Exception as e:
+            logger.error(f"Failed to close orders for market {market_id}: {e}")
+            return {"success": False, "error": str(e), "count": 0}
+
     async def check_allowance(self, token_id: str) -> Dict[str, Any]:
         """Check token balance and allowance."""
         if not self.is_configured():

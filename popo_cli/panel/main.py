@@ -382,7 +382,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
     prev_current_price = None
     last_valid_current_price = None  # Cache last valid price for fallback
     price_to_beat_state = {"slug": None, "value": None, "setAtMs": None}
-    previous_market_end_info = {"slug": None, "endMs": None}
+    previous_snapshot_current_price = None  # Store the last saved snapshot's current_price
     price_history: List[Dict[str, Any]] = []
     signal_stats = {"marketSlug": None, "upSignals": 0, "downSignals": 0}
     last_saved_market_end: Optional[int] = None
@@ -394,6 +394,10 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
     last_valid_poly_data: Optional[Dict[str, Any]] = None  # Cache last valid Polymarket data
     poly_fetch_failures = 0
     ws_connection_warnings_shown = False  # Track if we've warned about WS connections
+
+    # Health check state
+    last_health_check = 0
+    health_warning_shown = {"polymarket": False, "chainlink": False}
 
     # Create HTTP session
     import aiohttp
@@ -543,7 +547,6 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         last_refresh_trigger = current_refresh_trigger
 
                     # Get WebSocket prices (matching JS: wsTick, polymarketWsTick, chainlinkWsTick)
-                    # Get WebSocket prices (matching JS: wsTick, polymarketWsTick, chainlinkWsTick)
                     ws_tick = binance_stream.get_last()
                     ws_price = ws_tick.get("price")
 
@@ -552,6 +555,31 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
                     chainlink_ws_tick = chainlink_stream.get_last() if chainlink_stream else {"price": None, "updatedAt": None}
                     chainlink_ws_price = chainlink_ws_tick.get("price")
+
+                    # Check WebSocket connection health periodically
+                    current_time = time.time()
+                    if current_time - last_health_check > 30:
+                        last_health_check = current_time
+
+                        # Check Polymarket stream health
+                        if not polymarket_live_stream.is_healthy(timeout_seconds=90):
+                            status = polymarket_live_stream.get_connection_status()
+                            if not health_warning_shown["polymarket"]:
+                                console.print("[yellow]⚠ Warning: Polymarket WebSocket stream unhealthy (no data for 90s)[/yellow]")
+                                console.print(f"[dim]  Status: connected={status['connected']}, attempts={status['connect_attempts']}[/dim]")
+                                health_warning_shown["polymarket"] = True
+                        else:
+                            health_warning_shown["polymarket"] = False
+
+                        # Check Chainlink stream health
+                        if chainlink_stream and not chainlink_stream.is_healthy(timeout_seconds=300):
+                            status = chainlink_stream.get_connection_status()
+                            if not health_warning_shown["chainlink"]:
+                                console.print("[yellow]⚠ Warning: Chainlink WebSocket stream unhealthy (no data for 5min)[/yellow]")
+                                console.print(f"[dim]  Status: connected={status['connected']}, subscribed={status.get('subscribed', False)}, attempts={status['connect_attempts']}[/dim]")
+                                health_warning_shown["chainlink"] = True
+                        else:
+                            health_warning_shown["chainlink"] = False
 
                     # Fetch data
                     timing = get_candle_window_timing(config["candle_window_minutes"])
@@ -812,69 +840,32 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         signal_stats = {"marketSlug": market_slug, "upSignals": 0, "downSignals": 0}
                         signals_history = []  # Reset signals history on market switch
 
-                        # Inherit price from previous market end
-                        inherited_price = None
-                        if previous_market_end_info.get("endMs") and price_history:
-                            target_ms = previous_market_end_info["endMs"]
-                            closest = None
-                            min_diff = float('inf')
-
-                            for entry in price_history:
-                                diff = abs(entry["timestampMs"] - target_ms)
-                                if diff < min_diff:
-                                    min_diff = diff
-                                    closest = entry["price"]
-
-                            if closest is not None and min_diff < 60_000:
-                                inherited_price = closest
+                        # Use the previous snapshot's current_price as price_to_beat for the new market
+                        inherited_price = previous_snapshot_current_price  # Simple!
 
                         price_to_beat_state = {
                             "slug": market_slug,
                             "value": inherited_price,
                             "setAtMs": int(time.time() * 1000) if inherited_price is not None else None
                         }
-                        previous_market_end_info = {"slug": None, "endMs": None}
 
-                    # Latch current price if no explicit or inherited price (matching JS logic)
-                    market_start_ms = None
-                    if poly.get("ok") and poly.get("market", {}).get("eventStartTime"):
-                        from datetime import datetime
-                        try:
-                            market_start_ms = int(datetime.fromisoformat(
-                                poly["market"]["eventStartTime"].replace("Z", "+00:00")
-                            ).timestamp() * 1000)
-                        except:
-                            pass
+                        if inherited_price is not None:
+                            console.print(f"[green]✓[/green] Market switched: price_to_beat = ${inherited_price:.2f} (from previous snapshot's current_price)")
 
-                    if (price_to_beat_state["slug"] == market_slug and
-                        price_to_beat_state["value"] is None and
-                        explicit_price_to_beat is None and
-                        current_price is not None):
-                        now_ms = int(time.time() * 1000)
-                        ok_to_latch = market_start_ms is None or now_ms >= market_start_ms
-                        if ok_to_latch:
-                            price_to_beat_state["value"] = float(current_price)
-                            price_to_beat_state["setAtMs"] = now_ms
+                    # Determine price_to_beat: use inherited price, or current price as fallback
+                    inherited_value = price_to_beat_state["value"] if price_to_beat_state["slug"] == market_slug else None
 
-                    price_to_beat = explicit_price_to_beat or (
-                        price_to_beat_state["value"] if price_to_beat_state["slug"] == market_slug else None
-                    )
-
-                    # Final fallback: if still None and we have current_price, use it as price_to_beat
-                    if price_to_beat is None and current_price is not None and price_to_beat_state["value"] is None:
-                        # Only do this for the first time for this market
-                        if price_to_beat_state["slug"] != market_slug:
-                            price_to_beat = float(current_price)
-                            price_to_beat_state = {
-                                "slug": market_slug,
-                                "value": float(current_price),
-                                "setAtMs": int(time.time() * 1000)
-                            }
-                            console.print(f"[cyan]Setting initial price_to_beat to current price: ${current_price:.2f}[/cyan]")
-
-                    # Debug logging for price to beat
-                    if price_to_beat is None:
-                        console.print(f"[dim]Debug price_to_beat: explicit={explicit_price_to_beat}, state_slug={price_to_beat_state['slug']}, market_slug={market_slug}, state_value={price_to_beat_state['value']}[/dim]")
+                    if inherited_value is not None:
+                        # Use inherited price from previous snapshot
+                        price_to_beat = inherited_value
+                    elif current_price is not None:
+                        # Fallback: use current price (first market or no previous snapshot)
+                        price_to_beat = float(current_price)
+                        price_to_beat_state["value"] = price_to_beat
+                        console.print(f"[cyan]Using current price as price_to_beat: ${current_price:.2f}[/cyan]")
+                    else:
+                        price_to_beat = None
+                        console.print(f"[red]Error: No price available for price_to_beat[/red]")
 
                     # Format output
                     p_long = time_aware.get("adjustedUp")
@@ -996,6 +987,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     display_data = {
                         "title": poly.get("market", {}).get("question", "-") if poly.get("ok") else "-",
                         "marketSlug": market_slug,
+                        "marketId": poly.get("market", {}).get("id", "") if poly.get("ok") else "",
                         "predictValue": predict_value,
                         "signal": signal,
                         "signalStats": signal_stats_str,
@@ -1038,8 +1030,9 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
                         prev_slug = _last_market_data.get("marketSlug")
                         prev_end_str = _last_market_data.get("_endDate", "")
+                        prev_market_id = _last_market_data.get("marketId", "")
 
-                        # Check if previous market ended
+                        # Check if previous market ended and save snapshot
                         if prev_end_str:
                             from datetime import datetime
                             try:
@@ -1048,17 +1041,36 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                                 prev_ended = prev_settlement_ms <= now_ms
 
                                 if prev_ended and prev_slug not in saved_market_slugs:
+                                    # Close any open orders for the ended market
+                                    if prev_market_id and trading_service:
+                                        try:
+                                            result = await trading_service.close_orders_for_market(prev_market_id)
+                                            if result.get("success") and result.get("count", 0) > 0:
+                                                count = result["count"]
+                                                console.print(f"[yellow]⚠ Market ended - closed {count} unsold order(s)[/yellow]")
+                                                # Clear open orders display
+                                                trading_state.open_orders = []
+                                        except Exception as e:
+                                            console.print(f"[dim]Failed to close orders for ended market: {e}[/dim]")
+
                                     if db:
                                         try:
                                             await db.save_snapshot(_last_market_data, coin, interval)
                                             saved_market_slugs.add(prev_slug)
                                             console.print(f"[green]✓[/green] Snapshot saved for: [cyan]{prev_slug[:40]}...[/cyan]")
 
-                                            # Store previous market end info for inheritance
-                                            previous_market_end_info = {
-                                                "slug": prev_slug,
-                                                "endMs": prev_settlement_ms
-                                            }
+                                            # Store the current_price from the saved snapshot for next inheritance
+                                            saved_current_price = _last_market_data.get("currentPriceLine")
+                                            if saved_current_price:
+                                                # Extract numeric price from the display string
+                                                import re
+                                                match = re.search(r'\$?([\d,]+\.?\d*)', saved_current_price)
+                                                if match:
+                                                    try:
+                                                        previous_snapshot_current_price = float(match.group(1).replace(',', ''))
+                                                        console.print(f"[dim]→ Stored current_price: ${previous_snapshot_current_price:.2f} for next market[/dim]")
+                                                    except ValueError:
+                                                        pass
                                         except Exception as e:
                                             console.print(f"[yellow]Warning: Failed to save snapshot for {prev_slug[:30]}: {e}[/yellow]")
                                     else:
