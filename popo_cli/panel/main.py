@@ -36,9 +36,8 @@ except Exception:
 from .config import get_config
 from .utils import (
     format_number, format_pct, fmt_time_left, fmt_progress_bar, get_candle_window_timing,
-    async_sleep_ms, price_to_beat_from_polymarket_market, format_signed_delta,
-    narrative_from_sign, narrative_from_rsi, narrative_from_slope, format_prob_pct,
-    parse_price_to_beat, extract_numeric_from_market
+    async_sleep_ms, format_signed_delta,
+    narrative_from_sign, narrative_from_rsi, narrative_from_slope, format_prob_pct
 )
 from .indicators import (
     compute_session_vwap, compute_vwap_series, compute_rsi, sma, slope_last,
@@ -49,6 +48,7 @@ from .data import (
     fetch_klines, fetch_last_price, fetch_chainlink_btc_usd, fetch_polymarket_snapshot,
     BinanceTradeStream, start_polymarket_chainlink_price_stream, start_chainlink_price_stream
 )
+from .candlestick import CandlestickBuilder, format_candlestick_display
 
 # Import trading service
 from ..trading import get_trading_service, PlaceOrderRequest, OrderInfo
@@ -220,7 +220,7 @@ class PanelDisplay:
 
         return Panel(content, border_style="bright_yellow", padding=(0, 1))
 
-    def render(self, data: Dict[str, Any]) -> Panel:
+    def render(self, data: Dict[str, Any], candlestick_panel: Optional[Panel] = None) -> Panel:
         """Render the panel display with new layout."""
         # Parse data
         title = data.get("title", "-")
@@ -305,8 +305,12 @@ class PanelDisplay:
             padding=(1, 2)
         )
 
-        # Create prediction boxes row
-        prediction_boxes = Columns([up_panel, down_panel], equal=True)
+        # Create prediction boxes row with candlestick
+        if candlestick_panel:
+            # UP, DOWN, and K线 chart
+            prediction_boxes = Columns([up_panel, down_panel, candlestick_panel], equal=True)
+        else:
+            prediction_boxes = Columns([up_panel, down_panel], equal=True)
 
         # Build indicators section
         indicators_text = f"""[bold cyan]Indicators[/bold cyan]
@@ -381,8 +385,8 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
     prev_spot_price = None
     prev_current_price = None
     last_valid_current_price = None  # Cache last valid price for fallback
-    price_to_beat_state = {"slug": None, "value": None, "setAtMs": None}
     previous_snapshot_current_price = None  # Store the last saved snapshot's current_price
+    price_to_beat_initialized = False  # Track if price_to_beat has been initialized
     price_history: List[Dict[str, Any]] = []
     signal_stats = {"marketSlug": None, "upSignals": 0, "downSignals": 0}
     last_saved_market_end: Optional[int] = None
@@ -399,6 +403,10 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
     last_health_check = 0
     health_warning_shown = {"polymarket": False, "chainlink": False}
 
+    # Candlestick chart builder (uses Chainlink price)
+    # K线周期与市场周期保持一致 (5m 或 15m)
+    candlestick_builder = CandlestickBuilder(interval_seconds=config["candle_window_minutes"] * 60)
+
     # Create HTTP session
     import aiohttp
     session = aiohttp.ClientSession()
@@ -412,10 +420,22 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
         async with db.pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         console.print("[green]✓[/green] Database connected - snapshots will be saved automatically")
+
+        # Get price_to_beat from the most recent snapshot's current_price
+        try:
+            previous_snapshot_current_price = await db.get_last_snapshot_current_price()
+            if previous_snapshot_current_price is not None:
+                console.print(f"[green]✓[/green] Price to beat initialized from last snapshot: ${previous_snapshot_current_price:.2f}")
+            else:
+                console.print("[dim]No previous snapshot found - will use current price as initial price_to_beat[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Warning: Failed to get last snapshot price: {e}[/yellow]")
+            previous_snapshot_current_price = None
     except Exception as e:
         console.print(f"[yellow]Warning: Database connection failed: {e}[/yellow]")
         console.print("[dim]Snapshots will not be saved. Run 'popo init-db' to set up the database.[/dim]")
         db = None
+        previous_snapshot_current_price = None
 
     # Start WebSocket streams (matching JS version)
     # 1. Binance trade stream
@@ -825,47 +845,25 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         if len(price_history) > 1000:
                             price_history = price_history[-1000:]
 
-                    # Handle market switching and price to beat
-                    explicit_price_to_beat = None
-                    if poly.get("ok") and poly.get("market"):
-                        explicit_price_to_beat = price_to_beat_from_polymarket_market(poly["market"])
-                        # Debug logging
-                        if explicit_price_to_beat is None:
-                            console.print(f"[dim]Debug: No explicit price_to_beat found in market data for {market_slug}[/dim]")
-                            console.print(f"[dim]  Market keys: {list(poly.get('market', {}).keys())[:10]}[/dim]")
+                        # Update candlestick builder with Chainlink price
+                        candlestick_builder.add_price(float(current_price), current_price_timestamp)
 
-                    # Market switch detection
-                    if market_slug and price_to_beat_state["slug"] != market_slug:
-                        # Reset signal stats on market switch
-                        signal_stats = {"marketSlug": market_slug, "upSignals": 0, "downSignals": 0}
-                        signals_history = []  # Reset signals history on market switch
-
-                        # Use the previous snapshot's current_price as price_to_beat for the new market
-                        inherited_price = previous_snapshot_current_price  # Simple!
-
-                        price_to_beat_state = {
-                            "slug": market_slug,
-                            "value": inherited_price,
-                            "setAtMs": int(time.time() * 1000) if inherited_price is not None else None
-                        }
-
-                        if inherited_price is not None:
-                            console.print(f"[green]✓[/green] Market switched: price_to_beat = ${inherited_price:.2f} (from previous snapshot's current_price)")
-
-                    # Determine price_to_beat: use inherited price, or current price as fallback
-                    inherited_value = price_to_beat_state["value"] if price_to_beat_state["slug"] == market_slug else None
-
-                    if inherited_value is not None:
-                        # Use inherited price from previous snapshot
-                        price_to_beat = inherited_value
-                    elif current_price is not None:
-                        # Fallback: use current price (first market or no previous snapshot)
+                    # Price to beat: use previous snapshot's current_price, or initialize once with current price
+                    if previous_snapshot_current_price is not None:
+                        price_to_beat = previous_snapshot_current_price
+                    elif not price_to_beat_initialized and current_price is not None:
+                        # One-time initialization: use current price as initial price_to_beat
                         price_to_beat = float(current_price)
-                        price_to_beat_state["value"] = price_to_beat
-                        console.print(f"[cyan]Using current price as price_to_beat: ${current_price:.2f}[/cyan]")
+                        previous_snapshot_current_price = price_to_beat  # Store it for subsequent use
+                        price_to_beat_initialized = True
+                        console.print(f"[cyan]Initial price_to_beat set to current price: ${current_price:.2f}[/cyan]")
+                    elif previous_snapshot_current_price is not None:
+                        # Already initialized, use the stored value
+                        price_to_beat = previous_snapshot_current_price
                     else:
                         price_to_beat = None
-                        console.print(f"[red]Error: No price available for price_to_beat[/red]")
+                        if not price_to_beat_initialized:
+                            console.print(f"[red]Error: No price available for price_to_beat[/red]")
 
                     # Format output
                     p_long = time_aware.get("adjustedUp")
@@ -1005,7 +1003,11 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     }
 
                     # Render main panel and trading panel
-                    main_panel = display.render(display_data)
+                    # Build candlestick chart panel
+                    candlestick_candles = candlestick_builder.get_display_candles()
+                    candlestick_panel = format_candlestick_display(candlestick_candles, current_price) if candlestick_candles else None
+
+                    main_panel = display.render(display_data, candlestick_panel)
                     trading_panel = display.render_trading_panel(trading_state)
 
                     # Update display with both panels stacked

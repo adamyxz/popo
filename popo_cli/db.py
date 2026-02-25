@@ -291,6 +291,27 @@ class Database:
 
             return [dict(row) for row in rows]
 
+    async def get_last_snapshot_current_price(self) -> Optional[float]:
+        """Get the current_price from the most recent snapshot.
+
+        Returns:
+            The current_price from the most recent snapshot, or None if no snapshots exist.
+        """
+        if not self.pool:
+            raise RuntimeError("Database not initialized. Call init() first.")
+
+        async with self.pool.acquire() as conn:
+            query = """
+                SELECT current_price
+                FROM snapshots
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """
+            row = await conn.fetchrow(query)
+            if row and row['current_price'] is not None:
+                return float(row['current_price'])
+            return None
+
     async def get_snapshots_stats(self):
         """Get comprehensive statistics about snapshots.
 
