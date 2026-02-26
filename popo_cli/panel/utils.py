@@ -68,15 +68,15 @@ def fmt_time_left(mins: Optional[float]) -> str:
 def fmt_progress_bar(mins: Optional[float], total_mins: float = 5.0) -> str:
     """Format time left as a progress bar."""
     if mins is None:
-        return "[dim]━━━━━━━━━━━[/dim]"
+        return "[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]"
 
     # Clamp between 0 and total
     remaining = max(0, min(mins, total_mins))
     elapsed = total_mins - remaining
     progress = elapsed / total_mins
 
-    # Calculate filled segments (11 segments total)
-    total_segments = 11
+    # Calculate filled segments (40 segments for better resolution)
+    total_segments = 40
     filled = int(progress * total_segments)
 
     # Build bar

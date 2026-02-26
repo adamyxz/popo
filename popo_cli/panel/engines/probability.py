@@ -1,4 +1,12 @@
-"""Probability scoring engine."""
+"""
+DEPRECATED: Probability scoring engine (LEGACY)
+
+This module contains the old indicator-based scoring system.
+The system now uses candle_direction.py as the unified probability engine.
+
+This file is kept for reference only. To use:
+    from popo_cli.panel.engines.probability import score_direction, apply_time_awareness
+"""
 
 from typing import Dict, Any, Optional
 

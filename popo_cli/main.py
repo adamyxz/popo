@@ -482,6 +482,45 @@ def handle_snapshots_command() -> None:
             console.print(time_table)
             console.print("\n[dim]Optimal Range: 25th-75th percentile of successful entry times[/dim]")
 
+            # Recent correct predictions table
+            recent_correct = stats.get("recent_correct_predictions", [])
+            if recent_correct:
+                recent_table = Table(title="[bold yellow]Recent Correct Predictions[/bold yellow] (Last 10)")
+                recent_table.add_column("Time", style="dim")
+                recent_table.add_column("Direction", justify="center", style="cyan")
+                recent_table.add_column("Signal", justify="center")
+                recent_table.add_column("Price to Beat", justify="right")
+                recent_table.add_column("Current Price", justify="right")
+                recent_table.add_column("Delta", justify="right")
+
+                for pred in recent_correct:
+                    timestamp = pred.get("timestamp")
+                    time_str = timestamp.strftime("%m-%d %H:%M") if timestamp else "-"
+                    direction = pred.get("direction", "-")
+                    up_sig = pred.get("up_signals", 0)
+                    down_sig = pred.get("down_signals", 0)
+                    signal_str = f"UP{up_sig} DOWN{down_sig}"
+                    ptb = f"${pred.get('price_to_beat', 0):.2f}" if pred.get('price_to_beat') else "-"
+                    curr = f"${pred.get('current_price', 0):.2f}" if pred.get('current_price') else "-"
+
+                    # Calculate delta
+                    delta = None
+                    if pred.get('price_to_beat') and pred.get('current_price'):
+                        delta_val = pred['current_price'] - pred['price_to_beat']
+                        delta = f"{delta_val:+.2f}"
+
+                    recent_table.add_row(
+                        time_str,
+                        f"[green]{direction}[/green]" if direction == "UP" else f"[red]{direction}[/red]",
+                        signal_str,
+                        ptb,
+                        curr,
+                        delta
+                    )
+
+                console.print("\n")
+                console.print(recent_table)
+
             await db.close()
         except Exception as e:
             console.print(f"[red]Error:[/red] {e}")

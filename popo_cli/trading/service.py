@@ -3,6 +3,7 @@
 import os
 import logging
 import asyncio
+import traceback
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -268,15 +269,35 @@ class PolymarketTradingService:
             error_str = str(exc).lower()
             return "invalid signature" in error_str or "signature verification failed" in error_str
 
+        def is_fok_fill_error(exc: Exception) -> bool:
+            """Check if exception is due to FOK order not being fully filled."""
+            error_str = str(exc).lower()
+            return "couldn't be fully filled" in error_str or "fok orders are fully filled or killed" in error_str
+
+        def get_friendly_error(exc: Exception) -> str:
+            """Get user-friendly error message."""
+            if is_fok_fill_error(exc):
+                return "订单无法成交 - 市场流动性不足"
+            error_str = str(exc).lower()
+            if "invalid signature" in error_str:
+                return "签名验证失败"
+            if "insufficient" in error_str and "balance" in error_str:
+                return "余额不足"
+            return f"订单失败: {str(exc)}"
+
         # Try current config
         try:
             result = await try_post(self._client)
             return await self._parse_order_result(result, request)
         except Exception as exc:
             if not is_signature_error(exc):
+                # Log detailed error for debugging
+                logger.debug(f"Order failed: {type(exc).__name__}: {exc}")
+                # Return user-friendly message
+                friendly_error = get_friendly_error(exc)
                 return PlaceOrderResponse(
                     success=False,
-                    error=f"Order failed: {exc}"
+                    error=friendly_error
                 )
 
         # Try fallback signature types
@@ -297,11 +318,15 @@ class PolymarketTradingService:
                 return await self._parse_order_result(result, request)
             except Exception as exc:
                 if is_signature_error(exc):
-                    logger.warning(f"signature_type={sig_type} failed")
+                    logger.debug(f"signature_type={sig_type} failed")
                 else:
+                    # Log detailed error for debugging
+                    logger.debug(f"Order failed with signature_type={sig_type}: {exc}")
+                    # Return user-friendly message
+                    friendly_error = get_friendly_error(exc)
                     return PlaceOrderResponse(
                         success=False,
-                        error=f"Order failed with signature_type={sig_type}: {exc}"
+                        error=friendly_error
                     )
 
         return PlaceOrderResponse(
@@ -412,7 +437,10 @@ class PolymarketTradingService:
 
     async def close_order(self, order_id: str) -> CloseOrderResponse:
         """Close/sell all positions for an order."""
+        print(f"[DEBUG] close_order called: order_id={order_id}")
+
         if not self.is_configured():
+            print(f"[DEBUG] close_order: service not configured")
             return CloseOrderResponse(
                 success=False,
                 order_id=order_id,
@@ -420,6 +448,7 @@ class PolymarketTradingService:
             )
 
         if not self._order_repo:
+            print(f"[DEBUG] close_order: order repo not initialized")
             return CloseOrderResponse(
                 success=False,
                 order_id=order_id,
@@ -427,16 +456,21 @@ class PolymarketTradingService:
             )
 
         # Get order info
+        print(f"[DEBUG] close_order: fetching order info...")
         order = await self._order_repo.get_order(order_id)
         if not order:
+            print(f"[DEBUG] close_order: order not found")
             return CloseOrderResponse(
                 success=False,
                 order_id=order_id,
                 error="Order not found"
             )
 
+        print(f"[DEBUG] close_order: order side={order.get('side')}, direction={order.get('direction')}")
+
         # Only close BUY orders (SELL orders don't need closing)
         if order.get("side") != "BUY":
+            print(f"[DEBUG] close_order: not a BUY order")
             return CloseOrderResponse(
                 success=False,
                 order_id=order_id,
@@ -452,15 +486,19 @@ class PolymarketTradingService:
             amount_in_dollars=0,  # Ignored for SELL
         )
 
+        print(f"[DEBUG] close_order: placing SELL order...")
         result = await self.place_order(sell_request)
+        print(f"[DEBUG] close_order: SELL order result: success={result.success}, error={result.error}")
 
         if result.success:
             # Update original order status
+            print(f"[DEBUG] close_order: updating order status...")
             await self._order_repo.update_order_status(
                 order_id,
                 "closed",
                 exit_data={"closed_at": datetime.now(timezone.utc).isoformat()}
             )
+            print(f"[DEBUG] close_order: status updated")
 
         return CloseOrderResponse(
             success=result.success,
@@ -472,17 +510,27 @@ class PolymarketTradingService:
 
     async def close_all_orders(self) -> List[CloseOrderResponse]:
         """Close all open BUY orders."""
+        print(f"[DEBUG] close_all_orders called")
+
         if not self._order_repo:
+            print(f"[DEBUG] close_all_orders: order repo not initialized")
             return []
 
+        print(f"[DEBUG] close_all_orders: fetching open orders...")
         open_orders = await self._order_repo.get_open_orders()
+        print(f"[DEBUG] close_all_orders: found {len(open_orders)} open orders")
+
         results = []
 
         for order in open_orders:
+            print(f"[DEBUG] close_all_orders: processing order {order.get('order_id')}, side={order.get('side')}")
             if order.get("side") == "BUY":
                 result = await self.close_order(order["order_id"])
                 results.append(result)
+            else:
+                print(f"[DEBUG] close_all_orders: skipping non-BUY order")
 
+        print(f"[DEBUG] close_all_orders: completed, returning {len(results)} results")
         return results
 
     async def get_open_orders(self) -> List[OrderInfo]:

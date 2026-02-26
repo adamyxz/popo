@@ -328,6 +328,7 @@ class Database:
             - down_correct_rate: DOWN prediction accuracy rate
             - up_entry_time_range: Optimal entry time range for UP (in seconds from start)
             - down_entry_time_range: Optimal entry time range for DOWN (in seconds from start)
+            - recent_correct_predictions: List of recent correct prediction snapshots
         """
         if not self.pool:
             raise RuntimeError("Database not initialized. Call init() first.")
@@ -352,6 +353,9 @@ class Database:
             # Store signal times for correct predictions
             up_signal_times = []  # List of seconds from snapshot timestamp
             down_signal_times = []
+
+            # Store recent correct predictions (most recent first)
+            recent_correct_predictions = []
 
             for row in rows:
                 # Determine direction
@@ -455,6 +459,21 @@ class Database:
                                         delta = snapshot_time - sig_dt
                                         down_signal_times.append(abs(int(delta.total_seconds())))
 
+                    # Add to recent correct predictions (only keep most recent 10)
+                    recent_correct_predictions.append({
+                        "id": row['id'],
+                        "timestamp": row['timestamp'],
+                        "direction": direction.upper(),
+                        "sentiment": sentiment,
+                        "up_signals": up_signals,
+                        "down_signals": down_signals,
+                        "price_to_beat": float(row['price_to_beat']) if row['price_to_beat'] else None,
+                        "current_price": float(row['current_price']) if row['current_price'] else None,
+                    })
+                    if len(recent_correct_predictions) > 10:
+                        # Remove oldest (first element since we process in ascending order)
+                        recent_correct_predictions.pop(0)
+
             # Calculate optimal entry time ranges
             # Use interquartile range (IQR) method to find typical signal timing
             def calculate_time_range(times):
@@ -470,14 +489,25 @@ class Database:
                 sorted_times = sorted(times)
                 n = len(sorted_times)
                 # Use 25th to 75th percentile as optimal range
-                q25_idx = int(n * 0.25)
-                q75_idx = int(n * 0.75)
+                # Use linear interpolation for better accuracy
+                import math
+                def percentile(data, p):
+                    """Calculate percentile using linear interpolation."""
+                    k = (p / 100) * (len(data) - 1)
+                    f = math.floor(k)
+                    c = math.ceil(k)
+                    if f == c:
+                        return data[int(k)]
+                    d0 = data[int(f)] * (c - k)
+                    d1 = data[int(c)] * (k - f)
+                    return d0 + d1
+
                 return {
                     "min": sorted_times[0],
                     "max": sorted_times[-1],
-                    "optimal_min": sorted_times[q25_idx],
-                    "optimal_max": sorted_times[q75_idx],
-                    "median": sorted_times[n // 2],
+                    "optimal_min": int(percentile(sorted_times, 25)),
+                    "optimal_max": int(percentile(sorted_times, 75)),
+                    "median": int(percentile(sorted_times, 50)),
                     "sample_size": n
                 }
 
@@ -502,7 +532,8 @@ class Database:
                 "down_correct_count": down_correct_count,
                 "down_correct_rate": round(down_correct_rate, 2),
                 "up_entry_time_range": up_entry_time_range,
-                "down_entry_time_range": down_entry_time_range
+                "down_entry_time_range": down_entry_time_range,
+                "recent_correct_predictions": list(reversed(recent_correct_predictions))  # Most recent first
             }
 
     async def close(self):

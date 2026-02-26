@@ -58,7 +58,28 @@ def get_config(coin: CoinType = "BTC", interval: IntervalType = "5m") -> dict:
         "gamma_base_url": "https://gamma-api.polymarket.com",
         "clob_base_url": "https://clob.polymarket.com",
 
-        "poll_interval_ms": 1000,
+        "poll_interval_ms": 150,
+        "candle_window_minutes": candle_window_minutes,
+
+        "vwap_slope_lookback_minutes": 5,
+        "rsi_period": 14,
+        "rsi_ma_period": 14,
+
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+
+        "deepseek": {
+            "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "llm_trigger_ratio": 0.5,  # Trigger when time_left <= 50% of candle window
+        },
+        "binance_base_url": "https://api.binance.com",
+        "gamma_base_url": "https://gamma-api.polymarket.com",
+        "clob_base_url": "https://clob.polymarket.com",
+
+        "poll_interval_ms": 150,
         "candle_window_minutes": candle_window_minutes,
 
         "vwap_slope_lookback_minutes": 5,

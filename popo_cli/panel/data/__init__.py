@@ -1,6 +1,12 @@
 """Data fetching layer for panel module."""
 
-from .binance import fetch_klines, fetch_last_price, BinanceTradeStream
+from .binance import (
+    fetch_klines,
+    fetch_last_price,
+    BinanceTradeStream,
+    BinanceKlineStream,
+    BinanceDepthStream
+)
 from .chainlink import fetch_chainlink_btc_usd, ChainlinkPriceStream
 from .chainlink_ws import start_chainlink_price_stream
 from .polymarket import (
@@ -19,6 +25,8 @@ __all__ = [
     "fetch_klines",
     "fetch_last_price",
     "BinanceTradeStream",
+    "BinanceKlineStream",
+    "BinanceDepthStream",
     "fetch_chainlink_btc_usd",
     "ChainlinkPriceStream",
     "start_chainlink_price_stream",
