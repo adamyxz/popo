@@ -942,7 +942,8 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
     # Start WebSocket streams (matching JS version)
     # 1. Binance K-line stream (for current candle data)
-    kline_interval = "1m"  # Match candle window
+    # Use selected market interval so "current candle" matches panel target (5m/15m)
+    kline_interval = config["interval"]
     binance_kline_stream = BinanceKlineStream(config["symbol"], kline_interval)
     asyncio.create_task(binance_kline_stream.start())
 
@@ -1149,13 +1150,17 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
                     # Fetch Binance data (with error handling)
                     try:
-                        klines_1m = await fetch_klines(session, config["symbol"], "1m", 240, config["binance_base_url"])
-                        klines_5m = await fetch_klines(session, config["symbol"], "5m", 200, config["binance_base_url"])
+                        klines = await fetch_klines(
+                            session,
+                            config["symbol"],
+                            config["interval"],
+                            240,
+                            config["binance_base_url"]
+                        )
                         last_price = await fetch_last_price(session, config["symbol"], config["binance_base_url"])
                     except Exception as e:
                         log_buffer.warning(f"Binance fetch failed: {e}")
-                        klines_1m = []
-                        klines_5m = []
+                        klines = []
                         last_price = None
 
                     # Fetch Polymarket (with error handling and caching)
@@ -1192,7 +1197,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                             poly = {"ok": False, "reason": "fetch_error"}
 
                     # Process data
-                    candles = klines_1m
+                    candles = klines
                     closes = [c["close"] for c in candles if c["close"] is not None]
 
                     if not closes:
@@ -1204,9 +1209,10 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     vwap_series = compute_vwap_series(candles)
                     vwap_now = vwap_series[-1] if vwap_series else None
 
-                    lookback = config["vwap_slope_lookback_minutes"]
-                    if vwap_series and len(vwap_series) >= lookback:
-                        vwap_slope = (vwap_now - vwap_series[-lookback]) / lookback if vwap_now is not None else None
+                    # Lookback is measured in bars of the selected interval (5m/15m), not wall-clock minutes.
+                    lookback_bars = config.get("vwap_slope_lookback_bars", config.get("vwap_slope_lookback_minutes", 5))
+                    if vwap_series and len(vwap_series) >= lookback_bars:
+                        vwap_slope = (vwap_now - vwap_series[-lookback_bars]) / lookback_bars if vwap_now is not None else None
                     else:
                         vwap_slope = None
 
@@ -1228,10 +1234,28 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                     ha = compute_heiken_ashi(candles)
                     consec = count_consecutive(ha) if ha else {"color": None, "count": 0}
 
-                    vwap_cross_count = count_vwap_crosses(closes, vwap_series or [], 20) if closes and vwap_series else None
+                    vwap_cross_lookback_bars = config.get("vwap_cross_lookback_bars", 20)
+                    vwap_cross_count = count_vwap_crosses(
+                        closes,
+                        vwap_series or [],
+                        vwap_cross_lookback_bars
+                    ) if closes and vwap_series else None
 
-                    volume_recent = sum(c["volume"] or 0 for c in candles[-20:]) if candles else 0
-                    volume_avg = sum(c["volume"] or 0 for c in candles[-120:]) / 6 if len(candles) >= 120 else None
+                    volume_recent_lookback_bars = config.get("volume_recent_lookback_bars", 20)
+                    volume_avg_lookback_bars = config.get("volume_avg_lookback_bars", 120)
+
+                    volume_recent = (
+                        sum(c["volume"] or 0 for c in candles[-volume_recent_lookback_bars:])
+                        if candles else 0
+                    )
+                    volume_avg = None
+                    if len(candles) >= volume_avg_lookback_bars:
+                        avg_per_bar_volume = (
+                            sum(c["volume"] or 0 for c in candles[-volume_avg_lookback_bars:])
+                            / volume_avg_lookback_bars
+                        )
+                        # Keep volume_avg on the same scale as volume_recent (sum over recent lookback bars).
+                        volume_avg = avg_per_bar_volume * volume_recent_lookback_bars
 
                     failed_vwap_reclaim = False
                     if vwap_now is not None and vwap_series and len(vwap_series) >= 3 and len(candles) >= 2:
@@ -1292,7 +1316,14 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
                         # Run candle direction prediction
                         # Use recent closes for volatility adaptation (last 20-30 candles)
-                        recent_closes = closes[-30:] if len(closes) >= 30 else closes
+                        current_candle_prev_closes_lookback_bars = config.get(
+                            "current_candle_prev_closes_lookback_bars",
+                            30
+                        )
+                        recent_closes = (
+                            closes[-current_candle_prev_closes_lookback_bars:]
+                            if len(closes) >= current_candle_prev_closes_lookback_bars else closes
+                        )
 
                         candle_direction_pred = predict_candle_direction(
                             open_price=current_kline.get("open"),
@@ -1309,6 +1340,15 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
 
                     # Predict next candle direction using technical indicators
                     # This can be calculated even without current_kline data
+                    next_candle_prev_closes_lookback_bars = config.get(
+                        "next_candle_prev_closes_lookback_bars",
+                        50
+                    )
+                    next_candle_prev_closes = (
+                        closes[-next_candle_prev_closes_lookback_bars:]
+                        if len(closes) >= next_candle_prev_closes_lookback_bars else closes
+                    )
+
                     next_candle_direction_pred = predict_next_candle_direction(
                         rsi=rsi_now,
                         rsi_slope=rsi_slope,
@@ -1319,7 +1359,7 @@ async def run_panel_async(coin: str = "BTC", interval: str = "5m"):
                         heiken_count=consec.get("count"),
                         bid_volume=depth_snapshot.get("bidVolume") if depth_snapshot else None,
                         ask_volume=depth_snapshot.get("askVolume") if depth_snapshot else None,
-                        prev_closes=closes[-50:] if len(closes) >= 50 else closes,
+                        prev_closes=next_candle_prev_closes,
                         regime=regime_info.get("regime"),
                     )
 

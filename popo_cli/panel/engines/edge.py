@@ -142,6 +142,34 @@ def decide(
     best_market = market_up if best_side == "UP" else market_down
     best_ev = ev_up if best_side == "UP" else ev_down
 
+    # LATE CHASE GUARD:
+    # In the final seconds, avoid buying already expensive outcomes even when
+    # edge/EV look positive. This protects against late fills with poor
+    # risk/reward when the candle direction is already mostly decided.
+    if window_minutes > 0:
+        remaining_ratio = remaining_minutes / window_minutes
+    else:
+        remaining_ratio = 1.0
+
+    if best_market is not None and best_model is not None:
+        # Final 12% of window (~36s for 5m, ~108s for 15m): no chasing >=85c.
+        if remaining_ratio <= 0.12 and best_market >= 0.85 and best_model >= 0.75:
+            return {
+                "action": "NO_TRADE",
+                "side": None,
+                "phase": phase,
+                "reason": f"late_chase_block_price_{best_market:.2f}_prob_{best_model:.2f}"
+            }
+
+        # Final 10% of window: lock out near-certain directional chasing.
+        if remaining_ratio <= 0.10 and best_model >= 0.97:
+            return {
+                "action": "NO_TRADE",
+                "side": None,
+                "phase": phase,
+                "reason": f"late_extreme_prob_block_prob_{best_model:.2f}"
+            }
+
     # ODDS AWARENESS: Check if odds are too poor to justify trade
     # Especially important in LATE phase when prices are skewed
     if best_market is not None:

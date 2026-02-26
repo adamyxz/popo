@@ -61,7 +61,12 @@ def get_config(coin: CoinType = "BTC", interval: IntervalType = "5m") -> dict:
         "poll_interval_ms": 150,
         "candle_window_minutes": candle_window_minutes,
 
-        "vwap_slope_lookback_minutes": 5,
+        "vwap_slope_lookback_bars": 5,
+        "vwap_cross_lookback_bars": 20,
+        "volume_recent_lookback_bars": 20,
+        "volume_avg_lookback_bars": 120,
+        "current_candle_prev_closes_lookback_bars": 30,
+        "next_candle_prev_closes_lookback_bars": 50,
         "rsi_period": 14,
         "rsi_ma_period": 14,
 
@@ -75,21 +80,6 @@ def get_config(coin: CoinType = "BTC", interval: IntervalType = "5m") -> dict:
             "model": "deepseek-chat",
             "llm_trigger_ratio": 0.5,  # Trigger when time_left <= 50% of candle window
         },
-        "binance_base_url": "https://api.binance.com",
-        "gamma_base_url": "https://gamma-api.polymarket.com",
-        "clob_base_url": "https://clob.polymarket.com",
-
-        "poll_interval_ms": 150,
-        "candle_window_minutes": candle_window_minutes,
-
-        "vwap_slope_lookback_minutes": 5,
-        "rsi_period": 14,
-        "rsi_ma_period": 14,
-
-        "macd_fast": 12,
-        "macd_slow": 26,
-        "macd_signal": 9,
-
         "polymarket": {
             "market_slug": os.getenv("POLYMARKET_SLUG", ""),
             "series_id": os.getenv("POLYMARKET_SERIES_ID", market_config["polymarket"][validated_interval]["series_id"]),
